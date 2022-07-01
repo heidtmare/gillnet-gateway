@@ -1,0 +1,9 @@
+services:
+  - name: my-application-ui
+    url: "http://my-application-ui.local:8080"
+
+  - name: my-token-app-svc
+    url: "http://my-token-application-svc.local:8080"
+
+  - name: my-application-svc
+    url: "http://my-application-svc.local:8080"

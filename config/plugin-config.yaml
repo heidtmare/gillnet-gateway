@@ -1,0 +1,14 @@
+plugins:
+
+- name: my-oauth-plugin
+  type: oauth2-plugin
+  config:
+    base-url: $MY_OAUTH_BASE_URL
+    client-id: $MY_OAUTH_CLIENT_ID
+    client-secret: $MY_OAUTH_CLIENT_SECRET
+
+- name: my-token-plugin
+  type: token-plugin
+  config:
+    keys: [api-key]
+    tokens: [ $MY_TOKEN ]

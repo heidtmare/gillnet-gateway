@@ -1,0 +1,35 @@
+routes:
+  - name: ui-route
+    service: my-application-ui
+    paths: [/, /index, /home, /landing]
+    strip-path: true
+
+  - name: tkn-svc-route
+    service: my-token-svc
+    paths: [/check]
+    strip-path: true
+    plugins:
+      - name: my-token-plugin
+
+  - name: my-application-svc-route
+    service: my-application-svc
+    paths: [/svc]
+
+  - name: my-application-svc-user-route
+    service: my-application-svc
+    paths: [/svc/user]
+    plugins:
+      - name: my-oauth-plugin
+        params:
+          roles: [user, admin]
+
+  - name: my-application-svc-admin-route
+    service: my-application-svc
+    paths: [/svc/admin]
+    plugins:
+      - name: my-oauth-plugin
+        params:
+          roles: [admin]
+          insert-headers:
+          "USER-ID": "{user-id}"
+          "USER-EMAIL": "{user-email}"

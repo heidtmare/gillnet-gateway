@@ -1,0 +1,42 @@
+# an open route with multple paths
+GET /
+GET /landing
+http://my-landing-ui.local:8080
+
+
+# This route allows multiple rest methods
+GET|POST|PUT /app1
+http://my-app1.local:8080
+
+
+# This route allows any rest method
+ANY /app1/too
+http://my-app1.local:8080
+
+
+# This route requires a key ckeck
+GET /token-app
+http://my-token-app.local:8080
+token: true
+
+
+# This route requires authentication
+GET /app2
+http://my-app2.local:8080
+auth: true
+
+
+# This route has role restrictions
+GET|POST|PUT /app/svc
+http://my-app-svc.local:8080
+auth: true
+roles:[user,admin]
+
+
+# This one injects inbound header info, and strips outbound headers
+GET|POST|PUT|DELETE /app/svc/admin
+http://my-app-svc.local:8080/admin
+auth: true
+roles: [admin] 
+insert-headers: [USER-ID:{user-id}, USER-EMAIL:{user-email}]
+remove-headers: [USER-ID, USER-EMAIL]]
