@@ -1,27 +1,62 @@
-use actix_web::{
-    dev::{HttpServiceFactory, ServiceFactory},
-    get, web, App, HttpServer, Responder,
-};
-use actix_web_lab::web::{self as web_lab, Redirect};
+mod config;
 
-#[get("/health")]
-async fn health() -> impl Responder {
-    format!("ok")
+use config::{Config, PluginConfig, RouteConfig, ServiceConfig};
+use serde_yaml::Value;
+use std::{env, fs, iter::Map, collections::HashMap};
+
+fn main() {
+    let filename = env::args().nth(1).expect("No config file provided");
+    let contents = fs::read_to_string(filename).expect("Could not read config file!");
+    let config: Config = serde_yaml::from_str(&contents).expect("Invalid yaml!");
+
+    let plugins: Vec<Plugin> = config
+        .plugins
+        .iter()
+        .map(|cfg| Plugin::from_config(cfg))
+        .collect();
+
+    let services: Vec<Service> = config
+        .services
+        .iter()
+        .map(|cfg| Service::from_config(cfg))
+        .collect();
+
+    let routes: Vec<Route> = config
+        .routes
+        .iter()
+        .map(|cfg| Route::from_config(cfg))
+        .collect();
+
+    println!("{:?}", services.get(0).unwrap().additional);
 }
 
-#[actix_web::main] // or #[tokio::main]
-async fn main() -> std::io::Result<()> {
-    HttpServer::new(|| App::new()
-    .service(health)
-    .service(load_services()))
-        .bind(("127.0.0.1", 8080))?
-        .run()
-        .await
+struct Plugin {
+    name: String,
+    ptype: String,
+    pub additional: HashMap<String, Value>,
+}
+impl Plugin {
+    pub fn from_config(config: &PluginConfig) -> Plugin {
+        Plugin {
+            name: config.name.to_owned(),
+            ptype: config.plugin_id.to_owned(),
+            additional: config.additional_properties.to_owned(),
+        }
+    }
 }
 
-fn load_services() -> Vec<Redirect> {
-    vec![
-        web_lab::Redirect::new("/cats", "http://cats.com"),
-        web_lab::Redirect::new("/dogs", "http://dogs.com"),
-    ]
+struct Service {
+    pub additional: Value,
+}
+impl Service {
+    pub fn from_config(config: &ServiceConfig) -> Service {
+        Service {additional: config.additional_properties.to_owned()}
+    }
+}
+
+struct Route {}
+impl Route {
+    pub fn from_config(config: &RouteConfig) -> Route {
+        Route {}
+    }
 }

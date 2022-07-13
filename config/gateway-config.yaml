@@ -2,20 +2,20 @@ plugins:
 
 - name: my-oauth-plugin
   type: oauth2-plugin
-  config:
-    base-url: $MY_OAUTH_BASE_URL
-    client-id: $MY_OAUTH_CLIENT_ID
-    client-secret: $MY_OAUTH_CLIENT_SECRET
+  base-url: $MY_OAUTH_BASE_URL
+  client-id: $MY_OAUTH_CLIENT_ID
+  client-secret: $MY_OAUTH_CLIENT_SECRET
 
 - name: my-token-plugin
   type: token-plugin
-  config:
-    keys: [api-key]
-    tokens: [ $MY_TOKEN ]
+  keys: [api-key]
+  tokens: [ $MY_TOKEN ]
 
 services:
+
   - name: my-application-ui
     url: "http://my-application-ui.local:8080"
+    fart: { "monkey":[1,2,3], "tiger": 9.8 }
 
   - name: my-token-app-svc
     url: "http://my-token-application-svc.local:8080"
@@ -24,6 +24,7 @@ services:
     url: "http://my-application-svc.local:8080"
 
 routes:
+
   - name: ui-route
     service: my-application-ui
     paths: [/, /index, /home, /landing]
