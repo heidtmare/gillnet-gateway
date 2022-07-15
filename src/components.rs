@@ -9,6 +9,7 @@ pub struct Plugin {
     pub ptype: String,
     pub params: HashMap<String, Value>,
 }
+
 impl Plugin {
     pub fn from_config(config: &PluginConfig) -> Plugin {
         Plugin {
@@ -23,6 +24,7 @@ pub struct Service {
     pub name: String,
     pub url: String,
 }
+
 impl Service {
     pub fn from_config(config: &ServiceConfig) -> Service {
         Service {
@@ -34,21 +36,19 @@ impl Service {
 
 pub struct Route {
     pub name: String,
-    pub service: Option<String>,
-    pub url: Option<String>,
+    pub url: String,
     pub paths: Vec<String>,
     pub strip_path: bool,
     pub plugins: Option<Vec<PluginReference>>,
 }
 
 impl Route {
-    pub fn from_config(config: &RouteConfig) -> Route {
-        Route {
+    pub fn from_config(config: &RouteConfig) -> Self {
+        Self {
             name: config.name.to_owned(),
-            service: config.service.to_owned(),
             url: config.url.to_owned(),
             paths: config.paths.to_owned(),
-            strip_path: config.strip_path.to_owned(),
+            strip_path: config.strip_path,
             plugins: config.plugins.to_owned(),
         }
     }

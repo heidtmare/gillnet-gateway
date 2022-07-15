@@ -5,9 +5,9 @@ use serde_yaml::Value;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct Config {
-    pub plugins: Vec<PluginConfig>,
-    pub services: Vec<ServiceConfig>,
+pub struct GatewayConfig {
+    pub plugins: Option<Vec<PluginConfig>>,
+    pub services: Option<Vec<ServiceConfig>>,
     pub routes: Vec<RouteConfig>,
 }
 
@@ -30,13 +30,17 @@ pub struct ServiceConfig {
     pub url: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteConfig {
     pub name: String,
-    pub service: Option<String>,
-    pub url: Option<String>,
+    pub url: String,
     pub paths: Vec<String>,
+
+    #[serde(alias = "match-type")]
+    #[serde(alias = "matchType")]
+    #[serde(default)]
+    pub match_type: MatchType,
 
     #[serde(alias = "strip-path")]
     #[serde(alias = "stripPath")]
@@ -44,6 +48,14 @@ pub struct RouteConfig {
     pub strip_path: bool,
 
     pub plugins: Option<Vec<PluginReference>>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+pub enum MatchType {
+    EXACT,
+    #[default]
+    PREFIX,
+    REGEX,
 }
 
 #[derive(Clone, Debug, Deserialize)]

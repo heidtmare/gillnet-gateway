@@ -1,49 +1,45 @@
-plugins:
+# plugins:
 
-- name: my-oauth-plugin
-  type: oauth2-plugin
-  params:
-    base-url: $MY_OAUTH_BASE_URL
-    client-id: $MY_OAUTH_CLIENT_ID
-    client-secret: $MY_OAUTH_CLIENT_SECRET
+# - name: my-oauth-plugin
+#   type: oauth2-plugin
+#   params:
+#     base-url: $MY_OAUTH_BASE_URL
+#     client-id: $MY_OAUTH_CLIENT_ID
+#     client-secret: $MY_OAUTH_CLIENT_SECRET
 
-- name: my-token-plugin
-  type: token-plugin
-  params:
-    keys: [api-key]
-    tokens: [ $MY_TOKEN ]
+# - name: my-token-plugin
+#   type: token-plugin
+#   params:
+#     keys: [api-key]
+#     tokens: [ $MY_TOKEN ]
 
-services:
+# services:
+#   - name: my-token-svc
+#     url: "http://my-token-application-svc.local:8080"
 
-  - name: my-application-ui
-    url: "http://my-application-ui.local:8080"
-
-  - name: my-token-app-svc
-    url: "http://my-token-application-svc.local:8080"
-
-  - name: my-application-svc
-    url: "http://my-application-svc.local:8080"
+#   - name: my-application-svc
+#     url: "http://my-application-svc.local:8080"
 
 routes:
-
   - name: ui-route
-    service: my-application-ui
-    paths: [/, /index, /home, /landing]
+    url: "http://my-application-ui.local:8080"
+    paths: [/index, /home, /landing]
     strip-path: true
 
   - name: tkn-svc-route
-    service: my-token-svc
+    url: my-token-svc
     paths: [/check]
     strip-path: true
     plugins:
       - name: my-token-plugin
 
   - name: my-application-svc-route
-    service: my-application-svc
-    paths: [/svc]
+    url: my-application-svc
+    paths: ["/svc"]
+    match-type: PREFIX
 
   - name: my-application-svc-user-route
-    service: my-application-svc
+    url: my-application-svc
     paths: [/svc/user]
     plugins:
       - name: my-oauth-plugin
@@ -51,7 +47,7 @@ routes:
           roles: [user, admin]
 
   - name: my-application-svc-admin-route
-    service: my-application-svc
+    url: my-application-svc
     paths: [/svc/admin]
     plugins:
       - name: my-oauth-plugin
