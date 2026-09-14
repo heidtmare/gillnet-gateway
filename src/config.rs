@@ -1,14 +1,92 @@
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_yaml::Value;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GatewayConfig {
+    #[serde(default)]
+    pub listen: ListenConfig,
+
+    #[serde(default)]
+    pub registration: RegistrationConfig,
+
     pub plugins: Option<Vec<PluginConfig>>,
     pub services: Option<Vec<ServiceConfig>>,
+
+    #[serde(default)]
     pub routes: Vec<RouteConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ListenConfig {
+    #[serde(default = "default_host")]
+    pub host: String,
+
+    #[serde(alias = "proxy-port")]
+    #[serde(alias = "proxyPort")]
+    #[serde(default = "default_proxy_port")]
+    pub proxy_port: u16,
+
+    #[serde(alias = "registration-port")]
+    #[serde(alias = "registrationPort")]
+    #[serde(default = "default_registration_port")]
+    pub registration_port: u16,
+}
+
+impl Default for ListenConfig {
+    fn default() -> Self {
+        Self {
+            host: default_host(),
+            proxy_port: default_proxy_port(),
+            registration_port: default_registration_port(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistrationConfig {
+    #[serde(alias = "heartbeat-ttl-seconds")]
+    #[serde(alias = "heartbeatTtlSeconds")]
+    #[serde(default = "default_heartbeat_ttl_seconds")]
+    pub heartbeat_ttl_seconds: u64,
+
+    #[serde(alias = "reap-interval-seconds")]
+    #[serde(alias = "reapIntervalSeconds")]
+    #[serde(default = "default_reap_interval_seconds")]
+    pub reap_interval_seconds: u64,
+}
+
+impl Default for RegistrationConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_ttl_seconds: default_heartbeat_ttl_seconds(),
+            reap_interval_seconds: default_reap_interval_seconds(),
+        }
+    }
+}
+
+fn default_host() -> String {
+    "0.0.0.0".to_owned()
+}
+
+fn default_proxy_port() -> u16 {
+    8080
+}
+
+fn default_registration_port() -> u16 {
+    8081
+}
+
+fn default_heartbeat_ttl_seconds() -> u64 {
+    30
+}
+
+fn default_reap_interval_seconds() -> u64 {
+    10
 }
 
 #[derive(Debug, Deserialize)]
@@ -50,7 +128,7 @@ pub struct RouteConfig {
     pub plugins: Option<Vec<PluginReference>>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
 pub enum MatchType {
     EXACT,
     #[default]

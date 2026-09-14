@@ -8,5 +8,7 @@ edition = "2021"
 [dependencies]
 actix-web = "4.15.0"
 actix-web-lab = "0.27.0"
+futures-util = "0.3.34"
+regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_yaml = "0.9.34"

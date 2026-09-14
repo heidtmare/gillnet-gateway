@@ -1,3 +1,20 @@
+listen:
+  # End-user traffic. Expose this one.
+  proxy-port: 8080
+  # Service self-registration. Cluster-internal only — do NOT expose via Ingress.
+  registration-port: 8081
+
+registration:
+  # An instance is evicted if it has not heartbeat within this window.
+  heartbeat-ttl-seconds: 30
+  reap-interval-seconds: 10
+
+# Statically declared backends. These cannot self-register, and they win over
+# any dynamic registration that claims the same name.
+# services:
+#   - name: my-token-svc
+#     url: "http://my-token-application-svc.local:8080"
+
 # plugins:
 
 # - name: my-oauth-plugin
@@ -13,13 +30,9 @@
 #     keys: [api-key]
 #     tokens: [ $MY_TOKEN ]
 
-# services:
-#   - name: my-token-svc
-#     url: "http://my-token-application-svc.local:8080"
-
-#   - name: my-application-svc
-#     url: "http://my-application-svc.local:8080"
-
+# Static routes. A route whose `url` is not http(s):// is a service reference,
+# resolved against static `services:` first, then the self-registration registry —
+# so a static route can point at a name that pods fill in at runtime.
 routes:
   - name: ui-route
     url: "http://my-application-ui.local:8080"
@@ -32,11 +45,6 @@ routes:
     strip-path: true
     plugins:
       - name: my-token-plugin
-
-  - name: my-application-svc-route
-    url: my-application-svc
-    paths: ["/svc"]
-    match-type: PREFIX
 
   - name: my-application-svc-user-route
     url: my-application-svc
@@ -53,7 +61,6 @@ routes:
       - name: my-oauth-plugin
         params:
           roles: [admin]
-          insert-headers: 
+          insert-headers:
             "USER-ID": "{user-id}"
             "USER-EMAIL": "{user-email}"
-          
