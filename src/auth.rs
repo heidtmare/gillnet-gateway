@@ -95,6 +95,16 @@ pub fn injected_header_names(guards: &[RouteGuard]) -> HashSet<String> {
 }
 
 impl AuthPolicy {
+    /// The plugin `type:` this policy was built from, so /registry/describe can
+    /// report what a route is guarded by without exposing the credentials.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            AuthPolicy::StaticToken { .. } => "token-plugin",
+            AuthPolicy::JwtHs256 { .. } => "jwt-plugin",
+            AuthPolicy::OAuth2(_) => "oauth2-plugin",
+        }
+    }
+
     pub fn from_config(config: &PluginConfig) -> Result<Self, String> {
         let header_keys = string_list(&config.params, "keys")?;
 
@@ -378,6 +388,20 @@ impl RouteGuard {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn policy_kind(&self) -> &'static str {
+        self.policy.kind()
+    }
+
+    pub fn required_roles(&self) -> &[String] {
+        &self.required_roles
+    }
+
+    /// Header name/template pairs only; the values are rendered per request
+    /// from verified claims and are never stored here.
+    pub fn insert_headers(&self) -> &[(String, String)] {
+        &self.insert_headers
     }
 
     pub fn from_reference(

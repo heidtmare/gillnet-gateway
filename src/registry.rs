@@ -140,6 +140,100 @@ pub struct RouteView {
     pub plugins: Vec<String>,
 }
 
+/// Where a registration came from: the declarative config file, or a service
+/// that registered itself at runtime.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum Source {
+    Static,
+    Dynamic,
+}
+
+/// Narrows what `describe` returns. An empty list means "no filter on this
+/// field"; filters combine with AND.
+#[derive(Debug, Default)]
+pub struct DescribeFilter {
+    pub services: Vec<String>,
+    pub routes: Vec<String>,
+    pub plugins: Vec<String>,
+    pub source: Option<Source>,
+    pub path: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescribeView {
+    pub summary: SummaryView,
+    pub plugins: Vec<PluginView>,
+    pub services: Vec<DescribedService>,
+    pub routes: Vec<DescribedRoute>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SummaryView {
+    pub heartbeat_ttl_seconds: u64,
+    pub services: usize,
+    pub instances: usize,
+    pub routes: usize,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginView {
+    pub name: String,
+    pub r#type: &'static str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescribedService {
+    pub service: String,
+    pub source: Source,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+
+    pub instances: Vec<InstanceView>,
+    pub routes: Vec<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DescribedRoute {
+    pub name: String,
+    pub source: Source,
+    pub target: TargetView,
+    pub paths: Vec<String>,
+    pub match_type: MatchType,
+    pub strip_path: bool,
+    pub plugins: Vec<GuardView>,
+}
+
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+pub enum TargetView {
+    Url {
+        url: String,
+    },
+    Service {
+        service: String,
+        /// Where the service name resolves today: the static `services:` block,
+        /// the self-registration registry, or nowhere (requests would 503).
+        resolution: &'static str,
+        instances: usize,
+    },
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GuardView {
+    pub name: String,
+    pub r#type: &'static str,
+    pub roles: Vec<String>,
+    pub insert_headers: HashMap<String, String>,
+}
+
 impl Registry {
     pub fn from_config(config: &GatewayConfig) -> Self {
         let mut policies: HashMap<String, Arc<AuthPolicy>> = HashMap::new();
@@ -295,17 +389,7 @@ impl Registry {
             .iter()
             .map(|(service, entry)| ServiceView {
                 service: service.to_owned(),
-                instances: entry
-                    .instances
-                    .iter()
-                    .map(|(instance_id, instance)| InstanceView {
-                        instance_id: instance_id.to_owned(),
-                        url: instance.url.to_owned(),
-                        seconds_since_heartbeat: now
-                            .saturating_duration_since(instance.last_heartbeat)
-                            .as_secs(),
-                    })
-                    .collect(),
+                instances: entry.instance_views(now),
                 routes: entry
                     .routes
                     .iter()
@@ -320,6 +404,197 @@ impl Registry {
             .collect();
         views.sort_by(|a, b| a.service.cmp(&b.service));
         views
+    }
+
+    /// Full picture of what the gateway will route, for operators and tooling.
+    /// Reports configuration only -- never plugin credentials.
+    pub fn describe(&self, filter: &DescribeFilter) -> DescribeView {
+        let now = Instant::now();
+
+        let mut routes = Vec::new();
+        let mut targeted: Vec<&str> = Vec::new();
+
+        let candidates = self
+            .static_routes
+            .iter()
+            .map(|route| (route, Source::Static))
+            .chain(
+                self.services
+                    .values()
+                    .flat_map(|entry| entry.routes.iter())
+                    .map(|route| (route, Source::Dynamic)),
+            );
+
+        for (route, source) in candidates {
+            if !self.route_matches(route, source, filter) {
+                continue;
+            }
+            if let Target::Service(name) = &route.target {
+                targeted.push(name);
+            }
+            routes.push(self.describe_route(route, source));
+        }
+        routes.sort_by(|a, b| a.name.cmp(&b.name));
+
+        // A route-shaped filter also narrows the services: only those the
+        // surviving routes actually point at are worth reporting.
+        let narrowed =
+            !filter.routes.is_empty() || !filter.plugins.is_empty() || filter.path.is_some();
+
+        let mut services = Vec::new();
+
+        for (service, url) in &self.static_services {
+            if !Self::service_matches(service, Source::Static, filter, narrowed, &targeted) {
+                continue;
+            }
+            services.push(DescribedService {
+                service: service.to_owned(),
+                source: Source::Static,
+                url: Some(url.to_owned()),
+                instances: Vec::new(),
+                routes: route_names(&routes, service),
+            });
+        }
+
+        for (service, entry) in &self.services {
+            if !Self::service_matches(service, Source::Dynamic, filter, narrowed, &targeted) {
+                continue;
+            }
+            services.push(DescribedService {
+                service: service.to_owned(),
+                source: Source::Dynamic,
+                url: None,
+                instances: entry.instance_views(now),
+                routes: route_names(&routes, service),
+            });
+        }
+        services.sort_by(|a, b| a.service.cmp(&b.service));
+
+        let mut plugins: Vec<PluginView> = self
+            .policies
+            .iter()
+            .filter(|(name, _)| {
+                filter.plugins.is_empty() || filter.plugins.iter().any(|p| p == *name)
+            })
+            .map(|(name, policy)| PluginView {
+                name: name.to_owned(),
+                r#type: policy.kind(),
+            })
+            .collect();
+        plugins.sort_by(|a, b| a.name.cmp(&b.name));
+
+        DescribeView {
+            summary: SummaryView {
+                heartbeat_ttl_seconds: self.ttl.as_secs(),
+                services: services.len(),
+                instances: services.iter().map(|s| s.instances.len()).sum(),
+                routes: routes.len(),
+            },
+            plugins,
+            services,
+            routes,
+        }
+    }
+
+    fn route_matches(
+        &self,
+        route: &CompiledRoute,
+        source: Source,
+        filter: &DescribeFilter,
+    ) -> bool {
+        if filter.source.is_some_and(|wanted| wanted != source) {
+            return false;
+        }
+        if !filter.routes.is_empty() && !filter.routes.contains(&route.name) {
+            return false;
+        }
+        if !filter.services.is_empty() {
+            match &route.target {
+                Target::Service(name) => {
+                    if !filter.services.iter().any(|service| service == name) {
+                        return false;
+                    }
+                }
+                // A route straight to a URL belongs to no service.
+                Target::Url(_) => return false,
+            }
+        }
+        if !filter.plugins.is_empty()
+            && !route
+                .guards
+                .iter()
+                .any(|guard| filter.plugins.iter().any(|name| name == guard.name()))
+        {
+            return false;
+        }
+        if let Some(path) = &filter.path {
+            if route.match_path(path).is_none() {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn service_matches(
+        service: &str,
+        source: Source,
+        filter: &DescribeFilter,
+        narrowed: bool,
+        targeted: &[&str],
+    ) -> bool {
+        if filter.source.is_some_and(|wanted| wanted != source) {
+            return false;
+        }
+        if !filter.services.is_empty() && !filter.services.iter().any(|name| name == service) {
+            return false;
+        }
+        if narrowed && !targeted.contains(&service) {
+            return false;
+        }
+        true
+    }
+
+    fn describe_route(&self, route: &CompiledRoute, source: Source) -> DescribedRoute {
+        DescribedRoute {
+            name: route.name.to_owned(),
+            source,
+            target: match &route.target {
+                Target::Url(url) => TargetView::Url {
+                    url: url.to_owned(),
+                },
+                Target::Service(name) => {
+                    let registered = self.services.get(name);
+                    TargetView::Service {
+                        service: name.to_owned(),
+                        resolution: if self.static_services.contains_key(name) {
+                            "static"
+                        } else if registered.is_some() {
+                            "registry"
+                        } else {
+                            "unresolved"
+                        },
+                        instances: registered.map_or(0, |entry| entry.instances.len()),
+                    }
+                }
+            },
+            paths: route.paths.to_owned(),
+            match_type: route.match_type,
+            strip_path: route.strip_path,
+            plugins: route
+                .guards
+                .iter()
+                .map(|guard| GuardView {
+                    name: guard.name().to_owned(),
+                    r#type: guard.policy_kind(),
+                    roles: guard.required_roles().to_vec(),
+                    insert_headers: guard
+                        .insert_headers()
+                        .iter()
+                        .map(|(header, template)| (header.to_owned(), template.to_owned()))
+                        .collect(),
+                })
+                .collect(),
+        }
     }
 
     pub fn resolve(&self, path: &str) -> Resolution {
@@ -385,6 +660,24 @@ impl Registry {
             (*instance_id).to_owned(),
             entry.instances[*instance_id].url.to_owned(),
         ))
+    }
+}
+
+impl RegisteredService {
+    fn instance_views(&self, now: Instant) -> Vec<InstanceView> {
+        let mut views: Vec<InstanceView> = self
+            .instances
+            .iter()
+            .map(|(instance_id, instance)| InstanceView {
+                instance_id: instance_id.to_owned(),
+                url: instance.url.to_owned(),
+                seconds_since_heartbeat: now
+                    .saturating_duration_since(instance.last_heartbeat)
+                    .as_secs(),
+            })
+            .collect();
+        views.sort_by(|a, b| a.instance_id.cmp(&b.instance_id));
+        views
     }
 }
 
@@ -506,6 +799,18 @@ fn lookup(
         .get(name)
         .cloned()
         .ok_or_else(|| format!("unknown plugin '{name}' (not defined in the gateway config)"))
+}
+
+/// Names of the already-filtered routes that point at this service, so a
+/// service entry links back to what reaches it.
+fn route_names(routes: &[DescribedRoute], service: &str) -> Vec<String> {
+    routes
+        .iter()
+        .filter(|route| {
+            matches!(&route.target, TargetView::Service { service: name, .. } if name == service)
+        })
+        .map(|route| route.name.to_owned())
+        .collect()
 }
 
 fn compile_patterns(paths: &[String], match_type: MatchType) -> Result<Vec<Pattern>, String> {
