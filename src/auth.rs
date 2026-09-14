@@ -209,7 +209,8 @@ impl AuthPolicy {
                 }))
             }
             other => Err(format!(
-                "unknown plugin type '{other}' (expected 'token-plugin', 'jwt-plugin' or 'oauth2-plugin')"
+                "unknown plugin type '{other}' (expected 'token-plugin', 'jwt-plugin', \
+                 'oauth2-plugin' or 'wasm-plugin')"
             )),
         }
     }
@@ -677,7 +678,7 @@ fn string_list(params: &HashMap<String, Yaml>, key: &str) -> Result<Vec<String>,
 
 /// Expands `$VAR` and `${VAR}`. An unset variable is an error rather than an
 /// empty string, so a missing secret cannot silently become a valid credential.
-fn expand_env(raw: &str) -> Result<String, String> {
+pub(crate) fn expand_env(raw: &str) -> Result<String, String> {
     let mut out = String::with_capacity(raw.len());
     let mut chars = raw.chars().peekable();
 

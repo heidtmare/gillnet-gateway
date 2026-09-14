@@ -82,6 +82,43 @@ plugins:
       cache-negative-seconds: 5
       cache-max-entries: 10000
 
+  # A WebAssembly filter. The module is compiled once at startup; a missing
+  # file or a module that does not export the ABI is a startup failure, not a
+  # surprise 500 on the first request that reaches the route.
+  #
+  # `settings` is the only thing crossing into the module. A route referencing
+  # this plugin may layer its own `settings` over these -- mappings merge key by
+  # key, anything else is replaced -- so one module serves many routes with
+  # different configuration. /registry/describe reports the merged result per
+  # route, which is what the module will actually be handed.
+  #
+  # Filters run AFTER the auth plugins on a route, whatever order the route
+  # lists them in: a module should never see a request that failed auth.
+  #
+  # See plugins/README.md for the ABI and a worked example.
+  # - name: my-wasm-plugin
+  #   type: wasm-plugin
+  #   params:
+  #     # $VAR is expanded, so a deployment can point at a mounted volume.
+  #     path: ./plugins/header-policy/target/wasm32-unknown-unknown/release/header_policy.wasm
+  #     # Instructions one call may execute before it is killed. A module that
+  #     # loops forever trips this and fails the request; it does not hang a
+  #     # worker. Default 10000000, roughly a few milliseconds.
+  #     fuel: 10000000
+  #     # Ceiling on the module's linear memory. Default 16 MiB.
+  #     memory-max-bytes: 16777216
+  #     # What happens when the module itself fails -- traps, runs out of fuel,
+  #     # returns junk. Default false: the filter reached no decision, so the
+  #     # request is refused with 500 rather than forwarded past whatever the
+  #     # filter was there to enforce. Set true only for filters that are
+  #     # decorative (a header stamp, telemetry), never for ones that gate.
+  #     fail-open: false
+  #     settings:
+  #       require:
+  #         x-api-version: "*"
+  #       set:
+  #         x-gateway: gillnet
+
 # Static routes.
 #
 # A guarded route strips the credential it authenticated with -- Authorization
@@ -130,3 +167,22 @@ routes:
           insert-headers:
             "USER-ID": "{sub}"
             "USER-EMAIL": "{email}"
+
+  # A route may mix both kinds. The guard runs first; only if it passes does
+  # the module see the request. A header the module sets is the gateway's, so
+  # any copy the client sent is dropped before forwarding -- the same rule that
+  # protects insert-headers above.
+  # - name: my-filtered-route
+  #   url: my-application-svc
+  #   paths: [/svc/things]
+  #   plugins:
+  #     - name: my-jwt-plugin
+  #       params:
+  #         roles: [user]
+  #     - name: my-wasm-plugin
+  #       params:
+  #         # Layered over the plugin's own settings; `set` above survives
+  #         # because mappings merge rather than replace.
+  #         settings:
+  #           require:
+  #             x-api-version: "2"

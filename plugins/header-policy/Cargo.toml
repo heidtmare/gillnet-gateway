@@ -1,0 +1,20 @@
+# Detached from the gateway's own build: a guest is compiled for
+# wasm32-unknown-unknown, which the gateway itself is not.
+[workspace]
+
+[package]
+name = "header-policy"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true

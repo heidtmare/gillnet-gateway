@@ -7,12 +7,13 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::{AuthPolicy, RouteGuard};
-use crate::config::{GatewayConfig, MatchType, RouteConfig};
+use crate::config::{GatewayConfig, MatchType, PluginConfig, RouteConfig};
+use crate::wasm::{WasmFilter, WasmPlugin, WasmRuntime};
 
 pub struct Registry {
     static_routes: Vec<CompiledRoute>,
     static_services: HashMap<String, String>,
-    policies: HashMap<String, Arc<AuthPolicy>>,
+    plugins: HashMap<String, Plugin>,
     services: HashMap<String, RegisteredService>,
     ttl: Duration,
     userinfo_overrides: bool,
@@ -39,6 +40,24 @@ struct CompiledRoute {
     paths: Vec<String>,
     patterns: Vec<Pattern>,
     guards: Vec<RouteGuard>,
+    filters: Vec<WasmFilter>,
+}
+
+/// A plugin declared in the gateway config. Both kinds share one namespace, so
+/// a route referencing a name gets whichever was declared under it and a name
+/// cannot mean two different things.
+enum Plugin {
+    Auth(Arc<AuthPolicy>),
+    Wasm(Arc<WasmPlugin>),
+}
+
+impl Plugin {
+    fn kind(&self) -> &'static str {
+        match self {
+            Plugin::Auth(policy) => policy.kind(),
+            Plugin::Wasm(plugin) => plugin.kind(),
+        }
+    }
 }
 
 enum Target {
@@ -87,8 +106,9 @@ pub struct RouteSpec {
     pub plugins: Vec<PluginRequirement>,
 }
 
-/// What a self-registering service may say about auth: which gateway-defined
-/// policy it needs, never the credentials themselves.
+/// What a self-registering service may say about a plugin: which
+/// gateway-defined one it needs and how it wants that one tuned -- never the
+/// credentials, and never a module of its own.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PluginRequirement {
@@ -99,6 +119,11 @@ pub struct PluginRequirement {
 
     #[serde(default)]
     pub insert_headers: HashMap<String, String>,
+
+    /// Per-route settings for a wasm-plugin, layered over the ones the gateway
+    /// config gave it.
+    #[serde(default)]
+    pub settings: Option<serde_json::Value>,
 }
 
 pub enum RegistrationError {
@@ -119,6 +144,9 @@ pub struct Resolved {
     pub instance: Option<String>,
     pub target_url: String,
     pub guards: Vec<RouteGuard>,
+    /// WebAssembly filters for this route, in declared order. They run after
+    /// the guards: a module should never see a request that failed auth.
+    pub filters: Vec<WasmFilter>,
     pub forward_token: bool,
 }
 
@@ -196,6 +224,13 @@ pub struct SummaryView {
 pub struct PluginView {
     pub name: String,
     pub r#type: &'static str,
+
+    /// Where a wasm-plugin's module was loaded from. Omitted for the others.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<serde_json::Value>,
 }
 
 #[derive(Serialize)]
@@ -239,25 +274,39 @@ pub enum TargetView {
     },
 }
 
+/// One plugin as a route binds it. The fields that do not apply to the plugin's
+/// kind are omitted rather than sent empty, so `roles: []` never appears on a
+/// wasm-plugin and read as though a role check were in force.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GuardView {
     pub name: String,
     pub r#type: &'static str,
+
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub roles: Vec<String>,
+
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub insert_headers: HashMap<String, String>,
+
+    /// The plugin's base settings with this route's merged over them -- what
+    /// the module will actually be handed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub settings: Option<serde_json::Value>,
 }
 
 impl Registry {
     pub fn from_config(config: &GatewayConfig) -> Self {
-        let mut policies: HashMap<String, Arc<AuthPolicy>> = HashMap::new();
+        let mut plugins: HashMap<String, Plugin> = HashMap::new();
+        // Built on first use so a gateway with no wasm plugins never starts a
+        // compiler it has nothing to compile.
+        let mut runtime: Option<WasmRuntime> = None;
+
         for plugin in config.plugins.iter().flatten() {
-            let policy = AuthPolicy::from_config(plugin)
+            let built = build_plugin(plugin, &mut runtime)
                 .unwrap_or_else(|e| panic!("Invalid plugin '{}': {e}", plugin.name));
-            if policies
-                .insert(plugin.name.to_owned(), Arc::new(policy))
-                .is_some()
-            {
+
+            if plugins.insert(plugin.name.to_owned(), built).is_some() {
                 panic!(
                     "A plugin named '{}' is declared twice in the declarative configuration!",
                     plugin.name
@@ -289,7 +338,7 @@ impl Registry {
             }
             seen.push(&route.name);
             static_routes.push(
-                CompiledRoute::from_config(route, &policies)
+                CompiledRoute::from_config(route, &plugins)
                     .unwrap_or_else(|e| panic!("Invalid route '{}': {e}", route.name)),
             );
         }
@@ -297,7 +346,7 @@ impl Registry {
         Self {
             static_routes,
             static_services,
-            policies,
+            plugins,
             services: HashMap::new(),
             ttl: Duration::from_secs(config.registration.heartbeat_ttl_seconds),
             userinfo_overrides: config.testing.userinfo_overrides,
@@ -334,7 +383,7 @@ impl Registry {
             .iter()
             .enumerate()
             .map(|(index, spec)| {
-                CompiledRoute::from_spec(&request.service, index, spec, &self.policies)
+                CompiledRoute::from_spec(&request.service, index, spec, &self.plugins)
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(RegistrationError::Invalid)?;
@@ -413,7 +462,7 @@ impl Registry {
                         match_type: route.match_type,
                         strip_path: route.strip_path,
                         forward_token: route.forward_token,
-                        plugins: route.guards.iter().map(|g| g.name().to_owned()).collect(),
+                        plugins: route.plugin_names(),
                     })
                     .collect(),
             })
@@ -487,14 +536,24 @@ impl Registry {
         services.sort_by(|a, b| a.service.cmp(&b.service));
 
         let mut plugins: Vec<PluginView> = self
-            .policies
+            .plugins
             .iter()
             .filter(|(name, _)| {
                 filter.plugins.is_empty() || filter.plugins.iter().any(|p| p == *name)
             })
-            .map(|(name, policy)| PluginView {
+            .map(|(name, plugin)| PluginView {
                 name: name.to_owned(),
-                r#type: policy.kind(),
+                r#type: plugin.kind(),
+                module: match plugin {
+                    Plugin::Wasm(wasm) => Some(wasm.module_path().display().to_string()),
+                    Plugin::Auth(_) => None,
+                },
+                // Auth plugin params hold credentials and are never reported;
+                // wasm settings are plain configuration and are.
+                settings: match plugin {
+                    Plugin::Wasm(wasm) => Some(wasm.settings().clone()),
+                    Plugin::Auth(_) => None,
+                },
             })
             .collect();
         plugins.sort_by(|a, b| a.name.cmp(&b.name));
@@ -538,9 +597,9 @@ impl Registry {
         }
         if !filter.plugins.is_empty()
             && !route
-                .guards
+                .plugin_names()
                 .iter()
-                .any(|guard| filter.plugins.iter().any(|name| name == guard.name()))
+                .any(|bound| filter.plugins.iter().any(|name| name == bound))
         {
             return false;
         }
@@ -598,6 +657,8 @@ impl Registry {
             match_type: route.match_type,
             strip_path: route.strip_path,
             forward_token: route.forward_token,
+            // Guards first, because that is the order they run in regardless
+            // of how the route listed them.
             plugins: route
                 .guards
                 .iter()
@@ -610,7 +671,15 @@ impl Registry {
                         .iter()
                         .map(|(header, template)| (header.to_owned(), template.to_owned()))
                         .collect(),
+                    settings: None,
                 })
+                .chain(route.filters.iter().map(|filter| GuardView {
+                    name: filter.name().to_owned(),
+                    r#type: filter.kind(),
+                    roles: Vec::new(),
+                    insert_headers: HashMap::new(),
+                    settings: Some(filter.settings().clone()),
+                }))
                 .collect(),
         }
     }
@@ -663,6 +732,7 @@ impl Registry {
             instance,
             target_url: format!("{}{}", base_url.trim_end_matches('/'), upstream_path),
             guards: route.guards.to_owned(),
+            filters: route.filters.to_owned(),
             forward_token: route.forward_token,
         })
     }
@@ -703,17 +773,21 @@ impl RegisteredService {
 impl CompiledRoute {
     fn from_config(
         config: &RouteConfig,
-        policies: &HashMap<String, Arc<AuthPolicy>>,
+        plugins: &HashMap<String, Plugin>,
     ) -> Result<Self, String> {
-        let guards = config
-            .plugins
-            .iter()
-            .flatten()
-            .map(|reference| {
-                let policy = lookup(policies, &reference.name)?;
-                RouteGuard::from_reference(reference, policy)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut guards = Vec::new();
+        let mut filters = Vec::new();
+
+        for reference in config.plugins.iter().flatten() {
+            match lookup(plugins, &reference.name)? {
+                Plugin::Auth(policy) => {
+                    guards.push(RouteGuard::from_reference(reference, policy)?)
+                }
+                Plugin::Wasm(plugin) => {
+                    filters.push(WasmFilter::from_reference(plugin, reference)?)
+                }
+            }
+        }
 
         Ok(Self {
             name: config.name.to_owned(),
@@ -724,6 +798,7 @@ impl CompiledRoute {
             paths: config.paths.to_owned(),
             patterns: compile_patterns(&config.paths, config.match_type)?,
             guards,
+            filters,
         })
     }
 
@@ -731,14 +806,14 @@ impl CompiledRoute {
         service: &str,
         index: usize,
         spec: &RouteSpec,
-        policies: &HashMap<String, Arc<AuthPolicy>>,
+        plugins: &HashMap<String, Plugin>,
     ) -> Result<Self, String> {
-        let guards = spec
-            .plugins
-            .iter()
-            .map(|requirement| {
-                let policy = lookup(policies, &requirement.name)?;
-                RouteGuard::build(
+        let mut guards = Vec::new();
+        let mut filters = Vec::new();
+
+        for requirement in &spec.plugins {
+            match lookup(plugins, &requirement.name)? {
+                Plugin::Auth(policy) => guards.push(RouteGuard::build(
                     &requirement.name,
                     policy,
                     requirement.roles.to_owned(),
@@ -747,9 +822,22 @@ impl CompiledRoute {
                         .iter()
                         .map(|(header, template)| (header.to_owned(), template.to_owned()))
                         .collect(),
-                )
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+                )?),
+                Plugin::Wasm(plugin) => {
+                    let overrides = match &requirement.settings {
+                        Some(settings @ serde_json::Value::Object(_)) => settings.to_owned(),
+                        Some(_) => {
+                            return Err(format!(
+                                "plugin '{}': 'settings' must be an object",
+                                requirement.name
+                            ))
+                        }
+                        None => serde_json::Value::Object(serde_json::Map::new()),
+                    };
+                    filters.push(WasmFilter::build(plugin, overrides)?);
+                }
+            }
+        }
 
         Ok(Self {
             name: format!("{service}#{index}"),
@@ -760,7 +848,17 @@ impl CompiledRoute {
             paths: spec.paths.to_owned(),
             patterns: compile_patterns(&spec.paths, spec.match_type)?,
             guards,
+            filters,
         })
+    }
+
+    /// Every plugin bound to this route, whatever its kind.
+    fn plugin_names(&self) -> Vec<String> {
+        self.guards
+            .iter()
+            .map(|guard| guard.name().to_owned())
+            .chain(self.filters.iter().map(|f| f.name().to_owned()))
+            .collect()
     }
 
     fn match_path(&self, path: &str) -> Option<PathMatch> {
@@ -811,15 +909,36 @@ impl Pattern {
 }
 
 /// An unknown plugin name is rejected rather than ignored: a typo must not
-/// silently leave a route unauthenticated.
-fn lookup(
-    policies: &HashMap<String, Arc<AuthPolicy>>,
-    name: &str,
-) -> Result<Arc<AuthPolicy>, String> {
-    policies
-        .get(name)
-        .cloned()
-        .ok_or_else(|| format!("unknown plugin '{name}' (not defined in the gateway config)"))
+/// silently leave a route unauthenticated or unfiltered.
+fn lookup(plugins: &HashMap<String, Plugin>, name: &str) -> Result<Plugin, String> {
+    match plugins.get(name) {
+        Some(Plugin::Auth(policy)) => Ok(Plugin::Auth(policy.clone())),
+        Some(Plugin::Wasm(plugin)) => Ok(Plugin::Wasm(plugin.clone())),
+        None => Err(format!(
+            "unknown plugin '{name}' (not defined in the gateway config)"
+        )),
+    }
+}
+
+/// Dispatches a `plugins:` entry on its `type:`. The WebAssembly engine is
+/// created here on first need and reused by every module after it, so all of
+/// them share one compiler and one code cache.
+fn build_plugin(
+    config: &PluginConfig,
+    runtime: &mut Option<WasmRuntime>,
+) -> Result<Plugin, String> {
+    if config.plugin_id != "wasm-plugin" {
+        return AuthPolicy::from_config(config).map(|policy| Plugin::Auth(Arc::new(policy)));
+    }
+
+    let runtime = match runtime {
+        Some(runtime) => runtime,
+        None => runtime.insert(WasmRuntime::new()?),
+    };
+
+    runtime
+        .load(config)
+        .map(|plugin| Plugin::Wasm(Arc::new(plugin)))
 }
 
 /// Names of the already-filtered routes that point at this service, so a

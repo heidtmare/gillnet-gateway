@@ -10,6 +10,7 @@ use crate::auth::{self, AuthOutcome};
 use crate::config::ProxyConfig;
 use crate::registry::{Registry, Resolution, Resolved};
 use crate::testing::ClaimOverrides;
+use crate::wasm::{self, FilterOutcome, StopResponse, WasmFilter};
 use crate::websocket;
 
 /// Headers that apply to a single transport hop and must never be relayed.
@@ -53,7 +54,7 @@ pub async fn handler(
         query => format!("{}?{}", resolved.target_url, query),
     };
 
-    let identity = match auth::enforce(&resolved.guards, req.headers(), &client, &overrides).await {
+    let mut identity = match auth::enforce(&resolved.guards, req.headers(), &client, &overrides).await {
         AuthOutcome::Allowed(headers) => headers,
         AuthOutcome::Unauthorized(message) => {
             return HttpResponse::Unauthorized()
@@ -78,6 +79,35 @@ pub async fn handler(
     if !resolved.forward_token {
         blocked.extend(auth::credential_header_names(&resolved.guards));
     }
+
+    // WebAssembly filters run only once the guards have passed, so a module
+    // never sees a request the gateway was going to refuse anyway.
+    let edits = match wasm::on_request(
+        &resolved.filters,
+        &resolved.route,
+        req.method().as_str(),
+        req.path(),
+        req.query_string(),
+        req.headers(),
+    ) {
+        FilterOutcome::Continue(edits) => edits,
+        FilterOutcome::Stop(stop) => return stopped(*stop),
+        // The filter could not run and is not configured to fail open. Its
+        // decision is unknown, so the request does not go upstream.
+        FilterOutcome::Failed(message) => {
+            eprintln!(
+                "wasm filter failed for route={} path={}: {message}",
+                resolved.route,
+                req.path()
+            );
+            return HttpResponse::InternalServerError().body(format!("{message}\n"));
+        }
+    };
+    // A header a filter set is the gateway's, not the client's: any copy the
+    // client sent is dropped, exactly as for auth-injected identity headers.
+    blocked.extend(edits.remove);
+    blocked.extend(edits.set.iter().map(|(name, _)| name.to_owned()));
+    identity.extend(edits.set);
 
     if websocket::is_upgrade(req.headers()) {
         return websocket::proxy(
@@ -133,7 +163,7 @@ pub async fn handler(
     };
 
     match sent {
-        Ok(response) => relay(response),
+        Ok(response) => relay(response, &resolved.filters, &resolved.route),
         Err(error) => {
             eprintln!(
                 "upstream request failed: route={} source={} service={} instance={} target={target} error={error}",
@@ -147,23 +177,44 @@ pub async fn handler(
     }
 }
 
-fn relay<S>(response: ClientResponse<S>) -> HttpResponse
+fn relay<S>(response: ClientResponse<S>, filters: &[WasmFilter], route: &str) -> HttpResponse
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, awc::error::PayloadError>> + Unpin + 'static,
 {
     let dropped = connection_tokens(response.headers());
-    let headers: Vec<(HeaderName, HeaderValue)> = response
+    let mut headers: Vec<(HeaderName, HeaderValue)> = response
         .headers()
         .iter()
         .filter(|(name, _)| !is_hop_by_hop(name, &dropped))
         .map(|(name, value)| (name.clone(), value.clone()))
         .collect();
 
-    let mut builder = HttpResponse::build(response.status());
+    // The body is already streaming by the time a filter sees this, so the
+    // response phase can edit headers and nothing else.
+    let status = response.status();
+    let edits = wasm::on_response(filters, route, status.as_u16(), &headers);
+    headers.retain(|(name, _)| !edits.remove.iter().any(|dropped| dropped == name.as_str()));
+
+    let mut builder = HttpResponse::build(status);
     for header in headers {
         builder.append_header(header);
     }
+    for (name, value) in edits.set {
+        builder.insert_header((name, value));
+    }
     builder.streaming(response)
+}
+
+/// A filter answered the request itself; the upstream is never contacted.
+fn stopped(stop: StopResponse) -> HttpResponse {
+    let status = actix_web::http::StatusCode::from_u16(stop.status)
+        .unwrap_or(actix_web::http::StatusCode::FORBIDDEN);
+
+    let mut builder = HttpResponse::build(status);
+    for (name, value) in stop.headers {
+        builder.insert_header((name, value));
+    }
+    builder.body(stop.body)
 }
 
 fn gateway_error(error: &SendRequestError, resolved: &Resolved) -> HttpResponse {
