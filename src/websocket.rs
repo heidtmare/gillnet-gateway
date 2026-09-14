@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use actix_web::http::header::HeaderMap;
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::{CloseReason, Message, MessageStream, ProtocolError, Session};
@@ -28,6 +30,8 @@ pub async fn proxy(
     resolved: &Resolved,
     target: &str,
     max_frame_bytes: usize,
+    identity: &[(String, String)],
+    reserved: &HashSet<String>,
 ) -> HttpResponse {
     let mut upstream_request = client
         .ws(websocket_url(target))
@@ -47,10 +51,15 @@ pub async fn proxy(
             || name == "content-length"
             || name.as_str().starts_with("sec-websocket-")
             || name.as_str().starts_with("x-forwarded-")
+            || reserved.contains(name.as_str())
         {
             continue;
         }
         upstream_request = upstream_request.header(name.clone(), value.clone());
+    }
+
+    for (header, value) in identity {
+        upstream_request = upstream_request.set_header(header.as_str(), value.as_str());
     }
 
     if let Some(value) = forwarded_for(req) {

@@ -1,15 +1,18 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::{AuthPolicy, RouteGuard};
 use crate::config::{GatewayConfig, MatchType, RouteConfig};
 
 pub struct Registry {
     static_routes: Vec<CompiledRoute>,
     static_services: HashMap<String, String>,
+    policies: HashMap<String, Arc<AuthPolicy>>,
     services: HashMap<String, RegisteredService>,
     ttl: Duration,
 }
@@ -33,6 +36,7 @@ struct CompiledRoute {
     match_type: MatchType,
     paths: Vec<String>,
     patterns: Vec<Pattern>,
+    guards: Vec<RouteGuard>,
 }
 
 enum Target {
@@ -72,6 +76,23 @@ pub struct RouteSpec {
 
     #[serde(default)]
     pub strip_path: bool,
+
+    #[serde(default)]
+    pub plugins: Vec<PluginRequirement>,
+}
+
+/// What a self-registering service may say about auth: which gateway-defined
+/// policy it needs, never the credentials themselves.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PluginRequirement {
+    pub name: String,
+
+    #[serde(default)]
+    pub roles: Vec<String>,
+
+    #[serde(default)]
+    pub insert_headers: HashMap<String, String>,
 }
 
 pub enum RegistrationError {
@@ -91,6 +112,7 @@ pub struct Resolved {
     pub service: Option<String>,
     pub instance: Option<String>,
     pub target_url: String,
+    pub guards: Vec<RouteGuard>,
 }
 
 #[derive(Serialize)]
@@ -115,10 +137,26 @@ pub struct RouteView {
     pub paths: Vec<String>,
     pub match_type: MatchType,
     pub strip_path: bool,
+    pub plugins: Vec<String>,
 }
 
 impl Registry {
     pub fn from_config(config: &GatewayConfig) -> Self {
+        let mut policies: HashMap<String, Arc<AuthPolicy>> = HashMap::new();
+        for plugin in config.plugins.iter().flatten() {
+            let policy = AuthPolicy::from_config(plugin)
+                .unwrap_or_else(|e| panic!("Invalid plugin '{}': {e}", plugin.name));
+            if policies
+                .insert(plugin.name.to_owned(), Arc::new(policy))
+                .is_some()
+            {
+                panic!(
+                    "A plugin named '{}' is declared twice in the declarative configuration!",
+                    plugin.name
+                );
+            }
+        }
+
         let mut static_services = HashMap::new();
         for service in config.services.iter().flatten() {
             if static_services
@@ -143,7 +181,7 @@ impl Registry {
             }
             seen.push(&route.name);
             static_routes.push(
-                CompiledRoute::from_config(route)
+                CompiledRoute::from_config(route, &policies)
                     .unwrap_or_else(|e| panic!("Invalid route '{}': {e}", route.name)),
             );
         }
@@ -151,6 +189,7 @@ impl Registry {
         Self {
             static_routes,
             static_services,
+            policies,
             services: HashMap::new(),
             ttl: Duration::from_secs(config.registration.heartbeat_ttl_seconds),
         }
@@ -185,7 +224,9 @@ impl Registry {
             .routes
             .iter()
             .enumerate()
-            .map(|(index, spec)| CompiledRoute::from_spec(&request.service, index, spec))
+            .map(|(index, spec)| {
+                CompiledRoute::from_spec(&request.service, index, spec, &self.policies)
+            })
             .collect::<Result<Vec<_>, _>>()
             .map_err(RegistrationError::Invalid)?;
 
@@ -272,6 +313,7 @@ impl Registry {
                         paths: route.paths.to_owned(),
                         match_type: route.match_type,
                         strip_path: route.strip_path,
+                        plugins: route.guards.iter().map(|g| g.name().to_owned()).collect(),
                     })
                     .collect(),
             })
@@ -327,6 +369,7 @@ impl Registry {
             service,
             instance,
             target_url: format!("{}{}", base_url.trim_end_matches('/'), upstream_path),
+            guards: route.guards.to_owned(),
         })
     }
 
@@ -346,7 +389,20 @@ impl Registry {
 }
 
 impl CompiledRoute {
-    fn from_config(config: &RouteConfig) -> Result<Self, String> {
+    fn from_config(
+        config: &RouteConfig,
+        policies: &HashMap<String, Arc<AuthPolicy>>,
+    ) -> Result<Self, String> {
+        let guards = config
+            .plugins
+            .iter()
+            .flatten()
+            .map(|reference| {
+                let policy = lookup(policies, &reference.name)?;
+                RouteGuard::from_reference(reference, policy)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(Self {
             name: config.name.to_owned(),
             target: Target::parse(&config.url),
@@ -354,10 +410,34 @@ impl CompiledRoute {
             match_type: config.match_type,
             paths: config.paths.to_owned(),
             patterns: compile_patterns(&config.paths, config.match_type)?,
+            guards,
         })
     }
 
-    fn from_spec(service: &str, index: usize, spec: &RouteSpec) -> Result<Self, String> {
+    fn from_spec(
+        service: &str,
+        index: usize,
+        spec: &RouteSpec,
+        policies: &HashMap<String, Arc<AuthPolicy>>,
+    ) -> Result<Self, String> {
+        let guards = spec
+            .plugins
+            .iter()
+            .map(|requirement| {
+                let policy = lookup(policies, &requirement.name)?;
+                RouteGuard::build(
+                    &requirement.name,
+                    policy,
+                    requirement.roles.to_owned(),
+                    requirement
+                        .insert_headers
+                        .iter()
+                        .map(|(header, template)| (header.to_owned(), template.to_owned()))
+                        .collect(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
         Ok(Self {
             name: format!("{service}#{index}"),
             target: Target::Service(service.to_owned()),
@@ -365,6 +445,7 @@ impl CompiledRoute {
             match_type: spec.match_type,
             paths: spec.paths.to_owned(),
             patterns: compile_patterns(&spec.paths, spec.match_type)?,
+            guards,
         })
     }
 
@@ -413,6 +494,18 @@ impl Pattern {
             }
         }
     }
+}
+
+/// An unknown plugin name is rejected rather than ignored: a typo must not
+/// silently leave a route unauthenticated.
+fn lookup(
+    policies: &HashMap<String, Arc<AuthPolicy>>,
+    name: &str,
+) -> Result<Arc<AuthPolicy>, String> {
+    policies
+        .get(name)
+        .cloned()
+        .ok_or_else(|| format!("unknown plugin '{name}' (not defined in the gateway config)"))
 }
 
 fn compile_patterns(paths: &[String], match_type: MatchType) -> Result<Vec<Pattern>, String> {

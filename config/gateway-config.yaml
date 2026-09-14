@@ -23,20 +23,25 @@ proxy:
 #   - name: my-token-svc
 #     url: "http://my-token-application-svc.local:8080"
 
-# plugins:
+# Auth policies. Credentials live here only, sourced from the environment —
+# self-registering services reference a policy by name, they never supply one.
+# A referenced $VAR that is unset is a startup error, not an empty secret.
+plugins:
+  - name: my-token-plugin
+    type: token-plugin
+    params:
+      # Checked after "Authorization: Bearer", in this order.
+      keys: [api-key]
+      tokens: [$MY_TOKEN]
 
-# - name: my-oauth-plugin
-#   type: oauth2-plugin
-#   params:
-#     base-url: $MY_OAUTH_BASE_URL
-#     client-id: $MY_OAUTH_CLIENT_ID
-#     client-secret: $MY_OAUTH_CLIENT_SECRET
-
-# - name: my-token-plugin
-#   type: token-plugin
-#   params:
-#     keys: [api-key]
-#     tokens: [ $MY_TOKEN ]
+  - name: my-jwt-plugin
+    type: jwt-plugin
+    params:
+      secret: $JWT_SECRET
+      # issuer/audience are optional; when set they are enforced.
+      # issuer: https://auth.example.com
+      # audience: gillnet
+      roles-claim: roles
 
 # Static routes. A route whose `url` is not http(s):// is a service reference,
 # resolved against static `services:` first, then the self-registration registry —
@@ -58,17 +63,19 @@ routes:
     url: my-application-svc
     paths: [/svc/user]
     plugins:
-      - name: my-oauth-plugin
+      - name: my-jwt-plugin
         params:
-          roles: [user, admin]
+          roles: [user]
 
   - name: my-application-svc-admin-route
     url: my-application-svc
     paths: [/svc/admin]
     plugins:
-      - name: my-oauth-plugin
+      - name: my-jwt-plugin
         params:
           roles: [admin]
+          # {claim} is substituted from the verified token. Any client-sent
+          # copy of these headers is dropped before forwarding.
           insert-headers:
-            "USER-ID": "{user-id}"
-            "USER-EMAIL": "{user-email}"
+            "USER-ID": "{sub}"
+            "USER-EMAIL": "{email}"

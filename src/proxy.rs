@@ -6,6 +6,7 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use awc::error::SendRequestError;
 use awc::{Client, ClientResponse};
 
+use crate::auth::{self, AuthOutcome};
 use crate::config::ProxyConfig;
 use crate::registry::{Registry, Resolution, Resolved};
 use crate::websocket;
@@ -50,6 +51,21 @@ pub async fn handler(
         query => format!("{}?{}", resolved.target_url, query),
     };
 
+    let identity = match auth::enforce(&resolved.guards, req.headers()) {
+        AuthOutcome::Allowed(headers) => headers,
+        AuthOutcome::Unauthorized(message) => {
+            return HttpResponse::Unauthorized()
+                .insert_header(("www-authenticate", "Bearer"))
+                .body(format!("{message}\n"))
+        }
+        AuthOutcome::Forbidden(message) => {
+            return HttpResponse::Forbidden().body(format!("{message}\n"))
+        }
+    };
+    // A client could otherwise send these itself and impersonate a user to a
+    // backend that trusts them.
+    let reserved = auth::injected_header_names(&resolved.guards);
+
     if websocket::is_upgrade(req.headers()) {
         return websocket::proxy(
             &req,
@@ -58,6 +74,8 @@ pub async fn handler(
             &resolved,
             &target,
             settings.websocket_max_frame_bytes,
+            &identity,
+            &reserved,
         )
         .await;
     }
@@ -77,6 +95,7 @@ pub async fn handler(
             || name == "host"
             || name == "content-length"
             || name.as_str().starts_with("x-forwarded-")
+            || reserved.contains(name.as_str())
         {
             continue;
         }
@@ -88,6 +107,10 @@ pub async fn handler(
     }
     upstream = upstream.insert_header(("x-forwarded-proto", scheme));
     upstream = upstream.insert_header(("x-forwarded-host", host));
+
+    for (header, value) in &identity {
+        upstream = upstream.insert_header((header.as_str(), value.as_str()));
+    }
 
     // Preserve the client's framing: re-framing a length-delimited body as
     // chunked drops Content-Length, which some upstreams and WAFs reject.
