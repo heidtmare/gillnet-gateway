@@ -6,7 +6,9 @@ use actix_web::{web, HttpRequest, HttpResponse};
 use awc::error::SendRequestError;
 use awc::{Client, ClientResponse};
 
+use crate::config::ProxyConfig;
 use crate::registry::{Registry, Resolution, Resolved};
+use crate::websocket;
 
 /// Headers that apply to a single transport hop and must never be relayed.
 /// RFC 9110 section 7.6.1, plus the non-standard `proxy-connection`.
@@ -27,6 +29,7 @@ pub async fn handler(
     payload: web::Payload,
     registry: web::Data<RwLock<Registry>>,
     client: web::Data<Client>,
+    settings: web::Data<ProxyConfig>,
 ) -> HttpResponse {
     let resolution = { registry.read().unwrap().resolve(req.path()) };
 
@@ -46,6 +49,18 @@ pub async fn handler(
         "" => resolved.target_url.to_owned(),
         query => format!("{}?{}", resolved.target_url, query),
     };
+
+    if websocket::is_upgrade(req.headers()) {
+        return websocket::proxy(
+            &req,
+            payload,
+            &client,
+            &resolved,
+            &target,
+            settings.websocket_max_frame_bytes,
+        )
+        .await;
+    }
 
     let (scheme, host) = {
         let info = req.connection_info();
@@ -134,7 +149,7 @@ fn gateway_error(error: &SendRequestError, resolved: &Resolved) -> HttpResponse 
     }
 }
 
-fn forwarded_for(req: &HttpRequest) -> Option<String> {
+pub(crate) fn forwarded_for(req: &HttpRequest) -> Option<String> {
     let existing = req
         .headers()
         .get("x-forwarded-for")
@@ -148,8 +163,6 @@ fn forwarded_for(req: &HttpRequest) -> Option<String> {
     }
 }
 
-/// Header names nominated by a `Connection:` header are hop-by-hop for this
-/// message only, so they have to be discovered per request rather than listed.
 fn content_length(headers: &HeaderMap) -> Option<u64> {
     headers
         .get("content-length")?
@@ -160,7 +173,9 @@ fn content_length(headers: &HeaderMap) -> Option<u64> {
         .ok()
 }
 
-fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
+/// Header names nominated by a `Connection:` header are hop-by-hop for this
+/// message only, so they have to be discovered per request rather than listed.
+pub(crate) fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
     headers
         .get_all("connection")
         .filter_map(|value| value.to_str().ok())
@@ -170,7 +185,7 @@ fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
         .collect()
 }
 
-fn is_hop_by_hop(name: &HeaderName, connection_tokens: &[String]) -> bool {
+pub(crate) fn is_hop_by_hop(name: &HeaderName, connection_tokens: &[String]) -> bool {
     HOP_BY_HOP.contains(&name.as_str())
         || connection_tokens.iter().any(|token| token == name.as_str())
 }

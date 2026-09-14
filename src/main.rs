@@ -2,6 +2,7 @@ mod api;
 mod config;
 mod proxy;
 mod registry;
+mod websocket;
 
 use std::sync::RwLock;
 use std::time::Duration;
@@ -25,6 +26,7 @@ async fn main() -> Result<(), std::io::Error> {
     let reap_interval = Duration::from_secs(config.registration.reap_interval_seconds);
     let proxy_timeout = Duration::from_secs(config.proxy.timeout_seconds);
     let connect_timeout = Duration::from_secs(config.proxy.connect_timeout_seconds);
+    let proxy_settings = config.proxy.clone();
 
     let registry = web::Data::new(RwLock::new(Registry::from_config(&config)));
 
@@ -55,6 +57,7 @@ async fn main() -> Result<(), std::io::Error> {
             App::new()
                 .app_data(registry.clone())
                 .app_data(web::Data::new(client))
+                .app_data(web::Data::new(proxy_settings.clone()))
                 .default_service(web::to(proxy::handler))
         }
     })

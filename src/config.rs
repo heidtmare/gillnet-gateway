@@ -72,7 +72,7 @@ impl Default for RegistrationConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProxyConfig {
     #[serde(alias = "timeout-seconds")]
@@ -84,6 +84,11 @@ pub struct ProxyConfig {
     #[serde(alias = "connectTimeoutSeconds")]
     #[serde(default = "default_connect_timeout_seconds")]
     pub connect_timeout_seconds: u64,
+
+    #[serde(alias = "websocket-max-frame-bytes")]
+    #[serde(alias = "websocketMaxFrameBytes")]
+    #[serde(default = "default_websocket_max_frame_bytes")]
+    pub websocket_max_frame_bytes: usize,
 }
 
 impl Default for ProxyConfig {
@@ -91,8 +96,13 @@ impl Default for ProxyConfig {
         Self {
             timeout_seconds: default_proxy_timeout_seconds(),
             connect_timeout_seconds: default_connect_timeout_seconds(),
+            websocket_max_frame_bytes: default_websocket_max_frame_bytes(),
         }
     }
+}
+
+fn default_websocket_max_frame_bytes() -> usize {
+    64 * 1024
 }
 
 fn default_proxy_timeout_seconds() -> u64 {

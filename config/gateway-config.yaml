@@ -11,8 +11,11 @@ registration:
 
 proxy:
   # Upstream response timeout -> 504. Connect failures -> 502.
+  # Does not apply to websockets, which are long-lived by design.
   timeout-seconds: 30
   connect-timeout-seconds: 5
+  # Larger frames close the connection with 1009. Applies to both directions.
+  websocket-max-frame-bytes: 65536
 
 # Statically declared backends. These cannot self-register, and they win over
 # any dynamic registration that claims the same name.

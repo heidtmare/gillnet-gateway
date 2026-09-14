@@ -8,9 +8,12 @@ edition = "2021"
 [dependencies]
 actix-web = "4.15.0"
 actix-web-lab = "0.27.0"
+actix-ws = "0.4.0"
 awc = "3.8.2"
 bytes = "1.12.1"
+bytestring = "1.5.1"
 futures-util = "0.3.34"
 regex = "1.13.1"
 serde = { version = "1.0.229", features = ["derive"] }
+tokio = { version = "1.53.1", features = ["macros"] }
 yaml_serde = "0.10.7"
