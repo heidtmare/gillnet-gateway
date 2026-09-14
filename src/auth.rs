@@ -1,9 +1,14 @@
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use actix_web::http::header::{HeaderMap, HeaderValue};
+use awc::Client;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine;
 use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde_json::{Map, Value as Json};
+use sha2::{Digest, Sha256};
 use yaml_serde::Value as Yaml;
 
 use crate::config::{PluginConfig, PluginReference};
@@ -19,6 +24,31 @@ pub enum AuthPolicy {
         validation: Validation,
         roles_claim: String,
     },
+    OAuth2(OAuth2Policy),
+}
+
+pub struct OAuth2Policy {
+    header_keys: Vec<String>,
+    introspection_url: String,
+    userinfo_url: Option<String>,
+    authorization: String,
+    roles_claim: String,
+    timeout: Duration,
+    cache_max: Duration,
+    cache_negative: Duration,
+    cache_max_entries: usize,
+    cache: Mutex<HashMap<[u8; 32], CacheEntry>>,
+}
+
+struct CacheEntry {
+    outcome: CachedOutcome,
+    expires_at: Instant,
+}
+
+#[derive(Clone)]
+enum CachedOutcome {
+    Active(Arc<Map<String, Json>>),
+    Inactive,
 }
 
 #[derive(Clone)]
@@ -33,14 +63,19 @@ pub enum AuthOutcome {
     Allowed(Vec<(String, String)>),
     Unauthorized(String),
     Forbidden(String),
+    Unavailable(String),
 }
 
 /// Every guard on a route must pass; identity headers from all of them are merged.
-pub fn enforce(guards: &[RouteGuard], headers: &HeaderMap) -> AuthOutcome {
+pub async fn enforce(
+    guards: &[RouteGuard],
+    headers: &HeaderMap,
+    client: &Client,
+) -> AuthOutcome {
     let mut identity = Vec::new();
 
     for guard in guards {
-        match guard.check(headers) {
+        match guard.check(headers, client).await {
             Ok(mut injected) => identity.append(&mut injected),
             Err(outcome) => return outcome,
         }
@@ -105,8 +140,43 @@ impl AuthPolicy {
                     roles_claim,
                 })
             }
+            "oauth2-plugin" => {
+                let introspection_url = string(&config.params, "introspection-url")?
+                    .ok_or_else(|| "oauth2-plugin requires 'introspection-url'".to_owned())?;
+                let client_id = string(&config.params, "client-id")?
+                    .ok_or_else(|| "oauth2-plugin requires 'client-id'".to_owned())?;
+                let client_secret = string(&config.params, "client-secret")?
+                    .ok_or_else(|| "oauth2-plugin requires 'client-secret'".to_owned())?;
+
+                Ok(AuthPolicy::OAuth2(OAuth2Policy {
+                    header_keys,
+                    introspection_url,
+                    userinfo_url: string(&config.params, "userinfo-url")?,
+                    authorization: format!(
+                        "Basic {}",
+                        STANDARD.encode(format!("{client_id}:{client_secret}"))
+                    ),
+                    // OAuth2 authorization is scope-based by default.
+                    roles_claim: string(&config.params, "roles-claim")?
+                        .unwrap_or_else(|| "scope".to_owned()),
+                    timeout: Duration::from_secs(seconds(&config.params, "timeout-seconds", 5)?),
+                    cache_max: Duration::from_secs(seconds(
+                        &config.params,
+                        "cache-max-seconds",
+                        60,
+                    )?),
+                    cache_negative: Duration::from_secs(seconds(
+                        &config.params,
+                        "cache-negative-seconds",
+                        5,
+                    )?),
+                    cache_max_entries: seconds(&config.params, "cache-max-entries", 10_000)?
+                        as usize,
+                    cache: Mutex::new(HashMap::new()),
+                }))
+            }
             other => Err(format!(
-                "unknown plugin type '{other}' (expected 'token-plugin' or 'jwt-plugin')"
+                "unknown plugin type '{other}' (expected 'token-plugin', 'jwt-plugin' or 'oauth2-plugin')"
             )),
         }
     }
@@ -115,8 +185,169 @@ impl AuthPolicy {
         match self {
             AuthPolicy::StaticToken { header_keys, .. } => header_keys,
             AuthPolicy::JwtHs256 { header_keys, .. } => header_keys,
+            AuthPolicy::OAuth2(policy) => &policy.header_keys,
         }
     }
+}
+
+impl OAuth2Policy {
+    /// Returns the claims the provider vouches for, or an outcome to send back.
+    async fn claims(
+        &self,
+        token: &str,
+        client: &Client,
+    ) -> Result<Arc<Map<String, Json>>, AuthOutcome> {
+        let key = Sha256::digest(token.as_bytes()).into();
+
+        if let Some(cached) = self.cached(&key) {
+            return match cached {
+                CachedOutcome::Active(claims) => Ok(claims),
+                CachedOutcome::Inactive => Err(AuthOutcome::Unauthorized(
+                    "token rejected by the authorization provider".to_owned(),
+                )),
+            };
+        }
+
+        let introspection = self.introspect(token, client).await?;
+
+        let active = introspection
+            .get("active")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        let expired = introspection
+            .get("exp")
+            .and_then(Json::as_i64)
+            .is_some_and(|exp| exp <= unix_now());
+
+        if !active || expired {
+            self.store(key, CachedOutcome::Inactive, self.cache_negative);
+            return Err(AuthOutcome::Unauthorized(
+                "token rejected by the authorization provider".to_owned(),
+            ));
+        }
+
+        // Introspection is the authority on validity and scope, so it is laid
+        // over the UserInfo profile claims rather than under them.
+        let mut claims = match &self.userinfo_url {
+            Some(url) => self.userinfo(url, token, client).await?,
+            None => Map::new(),
+        };
+        claims.extend(introspection.clone());
+
+        let ttl = match introspection.get("exp").and_then(Json::as_i64) {
+            Some(exp) => self
+                .cache_max
+                .min(Duration::from_secs((exp - unix_now()).max(0) as u64)),
+            None => self.cache_max,
+        };
+
+        let claims = Arc::new(claims);
+        self.store(key, CachedOutcome::Active(claims.clone()), ttl);
+        Ok(claims)
+    }
+
+    async fn introspect(
+        &self,
+        token: &str,
+        client: &Client,
+    ) -> Result<Map<String, Json>, AuthOutcome> {
+        let mut response = client
+            .post(&self.introspection_url)
+            .timeout(self.timeout)
+            .insert_header(("authorization", self.authorization.as_str()))
+            .send_form(&[("token", token), ("token_type_hint", "access_token")])
+            .await
+            .map_err(|error| {
+                eprintln!("oauth2 introspection request failed: {error}");
+                AuthOutcome::Unavailable("authorization provider is unreachable".to_owned())
+            })?;
+
+        if !response.status().is_success() {
+            eprintln!(
+                "oauth2 introspection returned status {}",
+                response.status()
+            );
+            return Err(AuthOutcome::Unavailable(
+                "authorization provider returned an error".to_owned(),
+            ));
+        }
+
+        response.json::<Map<String, Json>>().await.map_err(|error| {
+            eprintln!("oauth2 introspection response was not valid JSON: {error}");
+            AuthOutcome::Unavailable("authorization provider returned an invalid response".to_owned())
+        })
+    }
+
+    async fn userinfo(
+        &self,
+        url: &str,
+        token: &str,
+        client: &Client,
+    ) -> Result<Map<String, Json>, AuthOutcome> {
+        let mut response = client
+            .get(url)
+            .timeout(self.timeout)
+            .insert_header(("authorization", format!("Bearer {token}")))
+            .send()
+            .await
+            .map_err(|error| {
+                eprintln!("oauth2 userinfo request failed: {error}");
+                AuthOutcome::Unavailable("authorization provider is unreachable".to_owned())
+            })?;
+
+        if !response.status().is_success() {
+            eprintln!("oauth2 userinfo returned status {}", response.status());
+            return Err(AuthOutcome::Unavailable(
+                "authorization provider returned an error".to_owned(),
+            ));
+        }
+
+        response.json::<Map<String, Json>>().await.map_err(|error| {
+            eprintln!("oauth2 userinfo response was not valid JSON: {error}");
+            AuthOutcome::Unavailable("authorization provider returned an invalid response".to_owned())
+        })
+    }
+
+    fn cached(&self, key: &[u8; 32]) -> Option<CachedOutcome> {
+        let cache = self.cache.lock().unwrap();
+        let entry = cache.get(key)?;
+
+        (entry.expires_at > Instant::now()).then(|| entry.outcome.clone())
+    }
+
+    fn store(&self, key: [u8; 32], outcome: CachedOutcome, ttl: Duration) {
+        let now = Instant::now();
+        let mut cache = self.cache.lock().unwrap();
+
+        if cache.len() >= self.cache_max_entries {
+            cache.retain(|_, entry| entry.expires_at > now);
+        }
+        if cache.len() >= self.cache_max_entries {
+            // Still full of live entries: drop the one expiring soonest.
+            if let Some(soonest) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(key, _)| *key)
+            {
+                cache.remove(&soonest);
+            }
+        }
+
+        cache.insert(
+            key,
+            CacheEntry {
+                outcome,
+                expires_at: now + ttl,
+            },
+        );
+    }
+}
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl RouteGuard {
@@ -145,6 +376,10 @@ impl RouteGuard {
         })
     }
 
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     pub fn from_reference(
         reference: &PluginReference,
         policy: Arc<AuthPolicy>,
@@ -167,7 +402,11 @@ impl RouteGuard {
         Self::build(&reference.name, policy, roles, insert_headers)
     }
 
-    fn check(&self, headers: &HeaderMap) -> Result<Vec<(String, String)>, AuthOutcome> {
+    async fn check(
+        &self,
+        headers: &HeaderMap,
+        client: &Client,
+    ) -> Result<Vec<(String, String)>, AuthOutcome> {
         let Some(token) = extract_token(headers, self.policy.header_keys()) else {
             return Err(AuthOutcome::Unauthorized(format!(
                 "missing credentials for '{}'",
@@ -206,19 +445,30 @@ impl RouteGuard {
                         ))
                     })?;
 
-                let granted = roles(&claims, roles_claim);
-                if let Some(missing) = self
-                    .required_roles
-                    .iter()
-                    .find(|required| !granted.contains(*required))
-                {
-                    return Err(AuthOutcome::Forbidden(format!(
-                        "token lacks required role '{missing}'"
-                    )));
-                }
-
+                self.authorize(&claims, roles_claim)?;
                 self.render_identity(&claims)
             }
+            AuthPolicy::OAuth2(policy) => {
+                let claims = policy.claims(&token, client).await?;
+
+                self.authorize(&claims, &policy.roles_claim)?;
+                self.render_identity(&claims)
+            }
+        }
+    }
+
+    fn authorize(&self, claims: &Map<String, Json>, roles_claim: &str) -> Result<(), AuthOutcome> {
+        let granted = roles(claims, roles_claim);
+
+        match self
+            .required_roles
+            .iter()
+            .find(|required| !granted.contains(*required))
+        {
+            Some(missing) => Err(AuthOutcome::Forbidden(format!(
+                "token lacks required role '{missing}'"
+            ))),
+            None => Ok(()),
         }
     }
 
@@ -333,6 +583,15 @@ fn string(params: &HashMap<String, Yaml>, key: &str) -> Result<Option<String>, S
     }
 }
 
+fn seconds(params: &HashMap<String, Yaml>, key: &str, default: u64) -> Result<u64, String> {
+    match params.get(key) {
+        Some(value) => value
+            .as_u64()
+            .ok_or_else(|| format!("'{key}' must be a positive integer")),
+        None => Ok(default),
+    }
+}
+
 fn string_list(params: &HashMap<String, Yaml>, key: &str) -> Result<Vec<String>, String> {
     match params.get(key) {
         Some(Yaml::Sequence(values)) => values
@@ -391,10 +650,4 @@ fn expand_env(raw: &str) -> Result<String, String> {
     }
 
     Ok(out)
-}
-
-impl RouteGuard {
-    pub fn name(&self) -> &str {
-        &self.name
-    }
 }

@@ -51,7 +51,7 @@ pub async fn handler(
         query => format!("{}?{}", resolved.target_url, query),
     };
 
-    let identity = match auth::enforce(&resolved.guards, req.headers()) {
+    let identity = match auth::enforce(&resolved.guards, req.headers(), &client).await {
         AuthOutcome::Allowed(headers) => headers,
         AuthOutcome::Unauthorized(message) => {
             return HttpResponse::Unauthorized()
@@ -60,6 +60,11 @@ pub async fn handler(
         }
         AuthOutcome::Forbidden(message) => {
             return HttpResponse::Forbidden().body(format!("{message}\n"))
+        }
+        // The token may well be valid; we simply cannot confirm it, so refuse
+        // rather than guess.
+        AuthOutcome::Unavailable(message) => {
+            return HttpResponse::ServiceUnavailable().body(format!("{message}\n"))
         }
     };
     // A client could otherwise send these itself and impersonate a user to a

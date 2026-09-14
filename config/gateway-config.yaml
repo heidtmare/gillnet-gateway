@@ -43,6 +43,23 @@ plugins:
       # audience: gillnet
       roles-claim: roles
 
+  # Asks an external provider about each token (RFC 7662 introspection, then
+  # UserInfo for profile claims). Results are cached until the token's own exp,
+  # capped at cache-max-seconds. If the provider cannot be reached the request
+  # is refused with 503 rather than allowed through.
+  - name: my-oauth-plugin
+    type: oauth2-plugin
+    params:
+      introspection-url: $MY_OAUTH_INTROSPECTION_URL
+      userinfo-url: $MY_OAUTH_USERINFO_URL
+      client-id: $MY_OAUTH_CLIENT_ID
+      client-secret: $MY_OAUTH_CLIENT_SECRET
+      roles-claim: scope
+      timeout-seconds: 5
+      cache-max-seconds: 60
+      cache-negative-seconds: 5
+      cache-max-entries: 10000
+
 # Static routes. A route whose `url` is not http(s):// is a service reference,
 # resolved against static `services:` first, then the self-registration registry —
 # so a static route can point at a name that pods fill in at runtime.
