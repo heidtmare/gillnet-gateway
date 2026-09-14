@@ -1,65 +1,34 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+//! Binding a plugin to a route, and enforcing the result.
+//!
+//! A plugin type decides what a credential *means* -- that lives in
+//! [`crate::plugins`]. What a particular route asks of it is here: which roles
+//! it requires and which identity headers it wants rendered from the verified
+//! claims. The same plugin can therefore guard one route for `admin` and
+//! another for `user` without being configured twice.
 
-use actix_web::http::header::{HeaderMap, HeaderValue};
+use std::collections::HashSet;
+use std::sync::Arc;
+
+use actix_web::http::header::{HeaderMap, HeaderName, HeaderValue};
 use awc::Client;
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine;
-use jsonwebtoken::{decode, Algorithm, DecodingKey, Validation};
 use serde_json::{Map, Value as Json};
-use sha2::{Digest, Sha256};
 use yaml_serde::Value as Yaml;
 
-use crate::config::{PluginConfig, PluginReference};
+use crate::config::PluginReference;
+use crate::plugins::{self, AuthPlugin};
 use crate::testing::ClaimOverrides;
 
-pub enum AuthPolicy {
-    StaticToken {
-        header_keys: Vec<String>,
-        tokens: Vec<String>,
-    },
-    JwtHs256 {
-        header_keys: Vec<String>,
-        key: DecodingKey,
-        validation: Validation,
-        roles_claim: String,
-    },
-    OAuth2(OAuth2Policy),
-}
-
-pub struct OAuth2Policy {
-    header_keys: Vec<String>,
-    introspection_url: String,
-    userinfo_url: Option<String>,
-    authorization: String,
-    roles_claim: String,
-    timeout: Duration,
-    cache_max: Duration,
-    cache_negative: Duration,
-    cache_max_entries: usize,
-    cache: Mutex<HashMap<[u8; 32], CacheEntry>>,
-}
-
-struct CacheEntry {
-    outcome: CachedOutcome,
-    expires_at: Instant,
-}
-
-#[derive(Clone)]
-enum CachedOutcome {
-    Active(Arc<Map<String, Json>>),
-    Inactive,
-}
-
+/// One plugin as a single route uses it.
 #[derive(Clone)]
 pub struct RouteGuard {
-    policy: Arc<AuthPolicy>,
-    name: String,
+    plugin: Arc<dyn AuthPlugin>,
     required_roles: Vec<String>,
     insert_headers: Vec<(String, String)>,
 }
 
+/// `Debug` so a failing test can say which outcome it got; the variants carry
+/// only messages already meant for a caller, never a credential.
+#[derive(Debug)]
 pub enum AuthOutcome {
     Allowed(Vec<(String, String)>),
     Unauthorized(String),
@@ -97,7 +66,7 @@ pub fn injected_header_names(guards: &[RouteGuard]) -> HashSet<String> {
 }
 
 /// Headers a guard on this route would read a credential out of: the standard
-/// `Authorization`, plus whatever `keys:` each policy was configured with.
+/// `Authorization`, plus whatever `keys:` each plugin was configured with.
 /// Stripped before forwarding unless the route opts into `forward-token`.
 ///
 /// An unguarded route yields nothing -- the gateway never looked at a
@@ -111,347 +80,51 @@ pub fn credential_header_names(guards: &[RouteGuard]) -> HashSet<String> {
         .chain(
             guards
                 .iter()
-                .flat_map(|guard| guard.policy.header_keys())
+                .flat_map(|guard| guard.plugin.header_keys())
                 .map(|key| key.to_ascii_lowercase()),
         )
         .collect()
 }
 
-impl AuthPolicy {
-    /// The plugin `type:` this policy was built from, so /registry/describe can
-    /// report what a route is guarded by without exposing the credentials.
-    pub fn kind(&self) -> &'static str {
-        match self {
-            AuthPolicy::StaticToken { .. } => "token-plugin",
-            AuthPolicy::JwtHs256 { .. } => "jwt-plugin",
-            AuthPolicy::OAuth2(_) => "oauth2-plugin",
-        }
-    }
-
-    pub fn from_config(config: &PluginConfig) -> Result<Self, String> {
-        let header_keys = string_list(&config.params, "keys")?;
-
-        match config.plugin_id.as_str() {
-            "token-plugin" => {
-                let tokens = string_list(&config.params, "tokens")?;
-                if tokens.is_empty() {
-                    return Err("token-plugin requires a non-empty 'tokens' list".to_owned());
-                }
-                if tokens.iter().any(|token| token.is_empty()) {
-                    return Err("token-plugin 'tokens' must not contain empty values".to_owned());
-                }
-                Ok(AuthPolicy::StaticToken {
-                    header_keys,
-                    tokens,
-                })
-            }
-            "jwt-plugin" => {
-                let secret = string(&config.params, "secret")?
-                    .ok_or_else(|| "jwt-plugin requires 'secret'".to_owned())?;
-                if secret.is_empty() {
-                    return Err("jwt-plugin 'secret' must not be empty".to_owned());
-                }
-
-                let mut validation = Validation::new(Algorithm::HS256);
-                if let Some(issuer) = string(&config.params, "issuer")? {
-                    validation.set_issuer(&[issuer]);
-                }
-                match string(&config.params, "audience")? {
-                    Some(audience) => validation.set_audience(&[audience]),
-                    // jsonwebtoken validates `aud` by default; without a configured
-                    // audience that would reject every token carrying one.
-                    None => validation.validate_aud = false,
-                }
-
-                let roles_claim =
-                    string(&config.params, "roles-claim")?.unwrap_or_else(|| "roles".to_owned());
-
-                Ok(AuthPolicy::JwtHs256 {
-                    header_keys,
-                    key: DecodingKey::from_secret(secret.as_bytes()),
-                    validation,
-                    roles_claim,
-                })
-            }
-            "oauth2-plugin" => {
-                let introspection_url = string(&config.params, "introspection-url")?
-                    .ok_or_else(|| "oauth2-plugin requires 'introspection-url'".to_owned())?;
-                let client_id = string(&config.params, "client-id")?
-                    .ok_or_else(|| "oauth2-plugin requires 'client-id'".to_owned())?;
-                let client_secret = string(&config.params, "client-secret")?
-                    .ok_or_else(|| "oauth2-plugin requires 'client-secret'".to_owned())?;
-
-                Ok(AuthPolicy::OAuth2(OAuth2Policy {
-                    header_keys,
-                    introspection_url,
-                    userinfo_url: string(&config.params, "userinfo-url")?,
-                    authorization: format!(
-                        "Basic {}",
-                        STANDARD.encode(format!("{client_id}:{client_secret}"))
-                    ),
-                    // OAuth2 authorization is scope-based by default.
-                    roles_claim: string(&config.params, "roles-claim")?
-                        .unwrap_or_else(|| "scope".to_owned()),
-                    timeout: Duration::from_secs(seconds(&config.params, "timeout-seconds", 5)?),
-                    cache_max: Duration::from_secs(seconds(
-                        &config.params,
-                        "cache-max-seconds",
-                        60,
-                    )?),
-                    cache_negative: Duration::from_secs(seconds(
-                        &config.params,
-                        "cache-negative-seconds",
-                        5,
-                    )?),
-                    cache_max_entries: seconds(&config.params, "cache-max-entries", 10_000)?
-                        as usize,
-                    cache: Mutex::new(HashMap::new()),
-                }))
-            }
-            other => Err(format!(
-                "unknown plugin type '{other}' (expected 'token-plugin', 'jwt-plugin', \
-                 'oauth2-plugin' or 'wasm-plugin')"
-            )),
-        }
-    }
-
-    fn header_keys(&self) -> &[String] {
-        match self {
-            AuthPolicy::StaticToken { header_keys, .. } => header_keys,
-            AuthPolicy::JwtHs256 { header_keys, .. } => header_keys,
-            AuthPolicy::OAuth2(policy) => &policy.header_keys,
-        }
-    }
-}
-
-impl OAuth2Policy {
-    /// Returns the claims the provider vouches for, or an outcome to send back.
-    async fn claims(
-        &self,
-        token: &str,
-        client: &Client,
-        overrides: &ClaimOverrides,
-    ) -> Result<Arc<Map<String, Json>>, AuthOutcome> {
-        // A test override replaces the provider outright rather than being
-        // merged with it, so routes can be exercised with no IdP reachable.
-        // Overrides are never cached -- they are already in memory, and a
-        // cached copy would outlive a PATCH that changed them.
-        if let Some(claims) = overrides.get(token) {
-            if expired(&claims) {
-                return Err(AuthOutcome::Unauthorized(
-                    "token rejected by the authorization provider".to_owned(),
-                ));
-            }
-            return Ok(claims);
-        }
-
-        let key = Sha256::digest(token.as_bytes()).into();
-
-        if let Some(cached) = self.cached(&key) {
-            return match cached {
-                CachedOutcome::Active(claims) => Ok(claims),
-                CachedOutcome::Inactive => Err(AuthOutcome::Unauthorized(
-                    "token rejected by the authorization provider".to_owned(),
-                )),
-            };
-        }
-
-        let introspection = self.introspect(token, client).await?;
-
-        let active = introspection
-            .get("active")
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
-        if !active || expired(&introspection) {
-            self.store(key, CachedOutcome::Inactive, self.cache_negative);
-            return Err(AuthOutcome::Unauthorized(
-                "token rejected by the authorization provider".to_owned(),
-            ));
-        }
-
-        // Introspection is the authority on validity and scope, so it is laid
-        // over the UserInfo profile claims rather than under them.
-        let mut claims = match &self.userinfo_url {
-            Some(url) => self.userinfo(url, token, client).await?,
-            None => Map::new(),
-        };
-        claims.extend(introspection.clone());
-
-        let ttl = match introspection.get("exp").and_then(Json::as_i64) {
-            Some(exp) => self
-                .cache_max
-                .min(Duration::from_secs((exp - unix_now()).max(0) as u64)),
-            None => self.cache_max,
-        };
-
-        let claims = Arc::new(claims);
-        self.store(key, CachedOutcome::Active(claims.clone()), ttl);
-        Ok(claims)
-    }
-
-    async fn introspect(
-        &self,
-        token: &str,
-        client: &Client,
-    ) -> Result<Map<String, Json>, AuthOutcome> {
-        let mut response = client
-            .post(&self.introspection_url)
-            .timeout(self.timeout)
-            .insert_header(("authorization", self.authorization.as_str()))
-            .send_form(&[("token", token), ("token_type_hint", "access_token")])
-            .await
-            .map_err(|error| {
-                eprintln!("oauth2 introspection request failed: {error}");
-                AuthOutcome::Unavailable("authorization provider is unreachable".to_owned())
-            })?;
-
-        if !response.status().is_success() {
-            eprintln!(
-                "oauth2 introspection returned status {}",
-                response.status()
-            );
-            return Err(AuthOutcome::Unavailable(
-                "authorization provider returned an error".to_owned(),
-            ));
-        }
-
-        response.json::<Map<String, Json>>().await.map_err(|error| {
-            eprintln!("oauth2 introspection response was not valid JSON: {error}");
-            AuthOutcome::Unavailable("authorization provider returned an invalid response".to_owned())
-        })
-    }
-
-    async fn userinfo(
-        &self,
-        url: &str,
-        token: &str,
-        client: &Client,
-    ) -> Result<Map<String, Json>, AuthOutcome> {
-        let mut response = client
-            .get(url)
-            .timeout(self.timeout)
-            .insert_header(("authorization", format!("Bearer {token}")))
-            .send()
-            .await
-            .map_err(|error| {
-                eprintln!("oauth2 userinfo request failed: {error}");
-                AuthOutcome::Unavailable("authorization provider is unreachable".to_owned())
-            })?;
-
-        if !response.status().is_success() {
-            eprintln!("oauth2 userinfo returned status {}", response.status());
-            return Err(AuthOutcome::Unavailable(
-                "authorization provider returned an error".to_owned(),
-            ));
-        }
-
-        response.json::<Map<String, Json>>().await.map_err(|error| {
-            eprintln!("oauth2 userinfo response was not valid JSON: {error}");
-            AuthOutcome::Unavailable("authorization provider returned an invalid response".to_owned())
-        })
-    }
-
-    fn cached(&self, key: &[u8; 32]) -> Option<CachedOutcome> {
-        let cache = self.cache.lock().unwrap();
-        let entry = cache.get(key)?;
-
-        (entry.expires_at > Instant::now()).then(|| entry.outcome.clone())
-    }
-
-    fn store(&self, key: [u8; 32], outcome: CachedOutcome, ttl: Duration) {
-        let now = Instant::now();
-        let mut cache = self.cache.lock().unwrap();
-
-        if cache.len() >= self.cache_max_entries {
-            cache.retain(|_, entry| entry.expires_at > now);
-        }
-        if cache.len() >= self.cache_max_entries {
-            // Still full of live entries: drop the one expiring soonest.
-            if let Some(soonest) = cache
-                .iter()
-                .min_by_key(|(_, entry)| entry.expires_at)
-                .map(|(key, _)| *key)
-            {
-                cache.remove(&soonest);
-            }
-        }
-
-        cache.insert(
-            key,
-            CacheEntry {
-                outcome,
-                expires_at: now + ttl,
-            },
-        );
-    }
-}
-
-/// An `exp` in the past, whether it came from the provider or from a test
-/// override, means the token is no longer good.
-fn expired(claims: &Map<String, Json>) -> bool {
-    claims
-        .get("exp")
-        .and_then(Json::as_i64)
-        .is_some_and(|exp| exp <= unix_now())
-}
-
-fn unix_now() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_secs() as i64)
-        .unwrap_or(0)
-}
-
 impl RouteGuard {
     pub fn build(
-        name: &str,
-        policy: Arc<AuthPolicy>,
+        plugin: Arc<dyn AuthPlugin>,
         required_roles: Vec<String>,
         insert_headers: Vec<(String, String)>,
     ) -> Result<Self, String> {
-        if !required_roles.is_empty() && matches!(*policy, AuthPolicy::StaticToken { .. }) {
+        let name = plugin.name();
+
+        // A plugin with no roles claim learned nothing about who presented the
+        // credential, so a role requirement on it could never be met. Saying so
+        // at startup beats a route that quietly rejects everyone.
+        if !required_roles.is_empty() && plugin.roles_claim().is_none() {
             return Err(format!(
-                "plugin '{name}' is a token-plugin and carries no claims, so it cannot require roles"
+                "plugin '{name}' is a {} and carries no claims, so it cannot require roles",
+                plugin.kind()
             ));
         }
+        // Validated as a header *name*: `HeaderValue` would accept a space,
+        // which is legal in a value and not in a name, and the bad name would
+        // only surface when a request tried to set it.
         for (header, _) in &insert_headers {
-            if HeaderValue::from_str(header).is_err() || header.trim().is_empty() {
+            if HeaderName::from_bytes(header.as_bytes()).is_err() {
                 return Err(format!("plugin '{name}' has an invalid header name '{header}'"));
             }
         }
 
         Ok(Self {
-            policy,
-            name: name.to_owned(),
+            plugin,
             required_roles,
             insert_headers,
         })
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    pub fn policy_kind(&self) -> &'static str {
-        self.policy.kind()
-    }
-
-    pub fn required_roles(&self) -> &[String] {
-        &self.required_roles
-    }
-
-    /// Header name/template pairs only; the values are rendered per request
-    /// from verified claims and are never stored here.
-    pub fn insert_headers(&self) -> &[(String, String)] {
-        &self.insert_headers
-    }
-
     pub fn from_reference(
         reference: &PluginReference,
-        policy: Arc<AuthPolicy>,
+        plugin: Arc<dyn AuthPlugin>,
     ) -> Result<Self, String> {
         let params = reference.params.clone().unwrap_or_default();
-        let roles = string_list(&params, "roles")?;
+        let roles = plugins::string_list(&params, "roles")?;
 
         let insert_headers = match params.get("insert-headers") {
             Some(Yaml::Mapping(mapping)) => mapping
@@ -465,66 +138,55 @@ impl RouteGuard {
             None => Vec::new(),
         };
 
-        Self::build(&reference.name, policy, roles, insert_headers)
+        Self::build(plugin, roles, insert_headers)
     }
 
+    pub fn name(&self) -> &str {
+        self.plugin.name()
+    }
+
+    pub fn kind(&self) -> &'static str {
+        self.plugin.kind()
+    }
+
+    pub fn required_roles(&self) -> &[String] {
+        &self.required_roles
+    }
+
+    /// Header name/template pairs only; the values are rendered per request
+    /// from verified claims and are never stored here.
+    pub fn insert_headers(&self) -> &[(String, String)] {
+        &self.insert_headers
+    }
+
+    /// Extract, verify, authorize, render -- the same four steps whatever the
+    /// plugin type, because everything type-specific happens inside
+    /// `authenticate`.
     async fn check(
         &self,
         headers: &HeaderMap,
         client: &Client,
         overrides: &ClaimOverrides,
     ) -> Result<Vec<(String, String)>, AuthOutcome> {
-        let Some(token) = extract_token(headers, self.policy.header_keys()) else {
+        let Some(token) = extract_token(headers, self.plugin.header_keys()) else {
             return Err(AuthOutcome::Unauthorized(format!(
                 "missing credentials for '{}'",
-                self.name
+                self.name()
             )));
         };
 
-        match &*self.policy {
-            AuthPolicy::StaticToken { tokens, .. } => {
-                let matched = tokens
-                    .iter()
-                    .any(|candidate| constant_time_eq(candidate.as_bytes(), token.as_bytes()));
+        let claims = self.plugin.authenticate(&token, client, overrides).await?;
 
-                if matched {
-                    Ok(Vec::new())
-                } else {
-                    Err(AuthOutcome::Unauthorized(format!(
-                        "invalid credentials for '{}'",
-                        self.name
-                    )))
-                }
-            }
-            AuthPolicy::JwtHs256 {
-                key,
-                validation,
-                roles_claim,
-                ..
-            } => {
-                let claims = decode::<Map<String, Json>>(&token, key, validation)
-                    .map(|data| data.claims)
-                    .map_err(|error| {
-                        AuthOutcome::Unauthorized(format!(
-                            "invalid token for '{}': {:?}",
-                            self.name,
-                            error.kind()
-                        ))
-                    })?;
-
-                self.authorize(&claims, roles_claim)?;
-                self.render_identity(&claims)
-            }
-            AuthPolicy::OAuth2(policy) => {
-                let claims = policy.claims(&token, client, overrides).await?;
-
-                self.authorize(&claims, &policy.roles_claim)?;
-                self.render_identity(&claims)
-            }
-        }
+        self.authorize(&claims)?;
+        self.render_identity(&claims)
     }
 
-    fn authorize(&self, claims: &Map<String, Json>, roles_claim: &str) -> Result<(), AuthOutcome> {
+    fn authorize(&self, claims: &Map<String, Json>) -> Result<(), AuthOutcome> {
+        // `build` refuses a role requirement on a plugin with no roles claim,
+        // so there is nothing left to check here.
+        let Some(roles_claim) = self.plugin.roles_claim() else {
+            return Ok(());
+        };
         let granted = roles(claims, roles_claim);
 
         match self
@@ -628,93 +290,208 @@ fn claim_to_string(value: &Json) -> Option<String> {
     }
 }
 
-/// Compares without an early exit so a caller cannot learn the correct prefix
-/// by timing repeated requests.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PluginConfig;
+    use crate::plugins::{jwt, token};
+    use actix_web::http::header::{HeaderName, HeaderValue};
+    use serde_json::json;
+
+    fn plugin(kind: &str, params: &str) -> Arc<dyn AuthPlugin> {
+        plugins::build(&PluginConfig {
+            name: format!("test-{kind}"),
+            plugin_id: kind.to_owned(),
+            params: yaml_serde::from_str(params).expect("invalid test params"),
+        })
+        .expect("the test plugin should build")
     }
 
-    let mut difference = 0u8;
-    for (left, right) in a.iter().zip(b) {
-        difference |= left ^ right;
+    fn guard(kind: &str, params: &str, reference: &str) -> Result<RouteGuard, String> {
+        RouteGuard::from_reference(
+            &PluginReference {
+                name: format!("test-{kind}"),
+                params: Some(yaml_serde::from_str(reference).expect("invalid test reference")),
+            },
+            plugin(kind, params),
+        )
     }
-    difference == 0
-}
 
-fn string(params: &HashMap<String, Yaml>, key: &str) -> Result<Option<String>, String> {
-    match params.get(key) {
-        Some(Yaml::String(raw)) => expand_env(raw).map(Some),
-        Some(_) => Err(format!("'{key}' must be a string")),
-        None => Ok(None),
+    fn claims(value: Json) -> Map<String, Json> {
+        value.as_object().unwrap().to_owned()
     }
-}
 
-fn seconds(params: &HashMap<String, Yaml>, key: &str, default: u64) -> Result<u64, String> {
-    match params.get(key) {
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| format!("'{key}' must be a positive integer")),
-        None => Ok(default),
+    fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.append(
+                HeaderName::from_static(name),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
     }
-}
 
-fn string_list(params: &HashMap<String, Yaml>, key: &str) -> Result<Vec<String>, String> {
-    match params.get(key) {
-        Some(Yaml::Sequence(values)) => values
-            .iter()
-            .map(|value| {
-                value
-                    .as_str()
-                    .ok_or_else(|| format!("'{key}' entries must be strings"))
-                    .and_then(expand_env)
-            })
-            .collect(),
-        Some(Yaml::String(raw)) => Ok(vec![expand_env(raw)?]),
-        Some(_) => Err(format!("'{key}' must be a list of strings")),
-        None => Ok(Vec::new()),
+    #[test]
+    fn a_plugin_carrying_no_claims_cannot_be_asked_for_roles() {
+        let Err(error) = guard(token::KIND, "tokens: [good]", "roles: [admin]") else {
+            panic!("a shared secret cannot satisfy a role requirement");
+        };
+        assert!(error.contains(token::KIND), "unexpected: {error}");
+
+        // Without roles the same plugin binds fine.
+        assert!(guard(token::KIND, "tokens: [good]", "{}").is_ok());
     }
-}
 
-/// Expands `$VAR` and `${VAR}`. An unset variable is an error rather than an
-/// empty string, so a missing secret cannot silently become a valid credential.
-pub(crate) fn expand_env(raw: &str) -> Result<String, String> {
-    let mut out = String::with_capacity(raw.len());
-    let mut chars = raw.chars().peekable();
+    #[test]
+    fn a_guard_takes_its_name_from_the_plugin_it_wraps() {
+        let guard = guard(jwt::KIND, "secret: shh", "{}").unwrap();
 
-    while let Some(character) = chars.next() {
-        if character != '$' {
-            out.push(character);
-            continue;
+        assert_eq!(guard.name(), "test-jwt-plugin");
+        assert_eq!(guard.kind(), jwt::KIND);
+    }
+
+    #[test]
+    fn an_unusable_header_name_is_refused_at_startup() {
+        // Built directly rather than through YAML so a name containing a
+        // newline -- the one that would splice headers -- can be tested at all.
+        let bound = |header: &str| {
+            RouteGuard::build(
+                plugin(jwt::KIND, "secret: shh"),
+                Vec::new(),
+                vec![(header.to_owned(), "{sub}".to_owned())],
+            )
+        };
+
+        // A space is legal in a header value and not in a name, so validating
+        // the name as a value would let these through to fail per request.
+        for bad in ["bad header", "", "  ", "x:user", "x\nuser", "x\r\nX-Admin: true"] {
+            assert!(bound(bad).is_err(), "{bad:?} is not a usable header name");
         }
 
-        let braced = chars.peek() == Some(&'{');
-        if braced {
-            chars.next();
-        }
-
-        let mut name = String::new();
-        while let Some(&next) = chars.peek() {
-            if next.is_ascii_alphanumeric() || next == '_' {
-                name.push(next);
-                chars.next();
-            } else {
-                break;
-            }
-        }
-
-        if braced && chars.next() != Some('}') {
-            return Err(format!("unterminated '${{' in '{raw}'"));
-        }
-        if name.is_empty() {
-            out.push('$');
-            continue;
-        }
-
-        let value = std::env::var(&name)
-            .map_err(|_| format!("environment variable '{name}' referenced by config is not set"))?;
-        out.push_str(&value);
+        assert!(bound("x-user").is_ok());
+        assert!(bound("USER-ID").is_ok());
     }
 
-    Ok(out)
+    #[test]
+    fn required_roles_must_all_be_granted() {
+        let guard = guard(jwt::KIND, "secret: shh", "roles: [admin, ops]").unwrap();
+
+        assert!(guard.authorize(&claims(json!({"roles": ["admin", "ops"]}))).is_ok());
+
+        let missing = guard.authorize(&claims(json!({"roles": ["admin"]})));
+        let Err(AuthOutcome::Forbidden(message)) = missing else {
+            panic!("a missing role must be forbidden");
+        };
+        assert!(message.contains("ops"), "unexpected: {message}");
+    }
+
+    #[test]
+    fn a_space_delimited_scope_reads_as_a_role_list() {
+        // OAuth2 sends `scope` as one string; a JWT sends an array. Both have
+        // to work or the same route config would behave differently per plugin.
+        assert_eq!(
+            roles(&claims(json!({"scope": "read write"})), "scope"),
+            ["read", "write"]
+        );
+        assert_eq!(
+            roles(&claims(json!({"roles": ["read", "write"]})), "roles"),
+            ["read", "write"]
+        );
+        assert!(roles(&claims(json!({"roles": 7})), "roles").is_empty());
+    }
+
+    #[test]
+    fn identity_headers_render_from_verified_claims() {
+        let guard = guard(
+            jwt::KIND,
+            "secret: shh",
+            "insert-headers: {'x-user': '{sub}', 'x-email': '{email}', 'x-age': 'n={age}'}",
+        )
+        .unwrap();
+
+        let rendered = guard
+            .render_identity(&claims(json!({"sub": "u1", "email": "a@b.c", "age": 41})))
+            .unwrap();
+
+        assert_eq!(
+            rendered,
+            [
+                ("x-user".to_owned(), "u1".to_owned()),
+                ("x-email".to_owned(), "a@b.c".to_owned()),
+                ("x-age".to_owned(), "n=41".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_header_referencing_an_absent_claim_is_skipped() {
+        let guard = guard(
+            jwt::KIND,
+            "secret: shh",
+            "insert-headers: {'x-user': '{sub}', 'x-missing': '{nope}'}",
+        )
+        .unwrap();
+
+        let rendered = guard.render_identity(&claims(json!({"sub": "u1"}))).unwrap();
+        assert_eq!(rendered, [("x-user".to_owned(), "u1".to_owned())]);
+    }
+
+    #[test]
+    fn a_claim_that_would_splice_headers_is_refused() {
+        let guard = guard(jwt::KIND, "secret: shh", "insert-headers: {'x-user': '{sub}'}").unwrap();
+
+        let spliced = guard.render_identity(&claims(json!({"sub": "u1\r\nX-Admin: true"})));
+        assert!(matches!(spliced, Err(AuthOutcome::Forbidden(_))));
+    }
+
+    #[test]
+    fn a_bearer_token_wins_over_a_configured_key_header() {
+        let keys = ["api-key".to_owned()];
+
+        assert_eq!(
+            extract_token(&headers(&[("authorization", "Bearer abc")]), &keys),
+            Some("abc".to_owned())
+        );
+        // Lowercase `bearer` is equally legal and some clients send it.
+        assert_eq!(
+            extract_token(&headers(&[("authorization", "bearer abc")]), &keys),
+            Some("abc".to_owned())
+        );
+        assert_eq!(
+            extract_token(
+                &headers(&[("authorization", "Bearer abc"), ("api-key", "xyz")]),
+                &keys
+            ),
+            Some("abc".to_owned())
+        );
+        assert_eq!(
+            extract_token(&headers(&[("api-key", "xyz")]), &keys),
+            Some("xyz".to_owned())
+        );
+        // An empty credential is no credential.
+        assert_eq!(extract_token(&headers(&[("authorization", "Bearer ")]), &keys), None);
+        assert_eq!(extract_token(&headers(&[("api-key", "  ")]), &keys), None);
+        assert_eq!(extract_token(&HeaderMap::new(), &keys), None);
+    }
+
+    #[test]
+    fn a_guarded_route_withholds_the_credential_it_consumed() {
+        let guard = guard(token::KIND, "{tokens: [good], keys: [Api-Key]}", "{}").unwrap();
+        let names = credential_header_names(std::slice::from_ref(&guard));
+
+        assert!(names.contains("authorization"));
+        assert!(names.contains("api-key"));
+
+        // An unguarded route consumed nothing, so it withholds nothing.
+        assert!(credential_header_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn injected_headers_are_reported_lowercase_for_matching() {
+        let guard = guard(jwt::KIND, "secret: shh", "insert-headers: {'USER-ID': '{sub}'}").unwrap();
+
+        let names = injected_header_names(std::slice::from_ref(&guard));
+        assert!(names.contains("user-id"));
+    }
 }

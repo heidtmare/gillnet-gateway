@@ -6,9 +6,10 @@ use std::time::{Duration, Instant};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::{AuthPolicy, RouteGuard};
+use crate::auth::RouteGuard;
 use crate::config::{GatewayConfig, MatchType, PluginConfig, RouteConfig};
-use crate::wasm::{WasmFilter, WasmPlugin, WasmRuntime};
+use crate::plugins::wasm::{self, WasmFilter, WasmPlugin, WasmRuntime};
+use crate::plugins::{self, AuthPlugin};
 
 pub struct Registry {
     static_routes: Vec<CompiledRoute>,
@@ -47,14 +48,14 @@ struct CompiledRoute {
 /// a route referencing a name gets whichever was declared under it and a name
 /// cannot mean two different things.
 enum Plugin {
-    Auth(Arc<AuthPolicy>),
+    Auth(Arc<dyn AuthPlugin>),
     Wasm(Arc<WasmPlugin>),
 }
 
 impl Plugin {
     fn kind(&self) -> &'static str {
         match self {
-            Plugin::Auth(policy) => policy.kind(),
+            Plugin::Auth(plugin) => plugin.kind(),
             Plugin::Wasm(plugin) => plugin.kind(),
         }
     }
@@ -664,7 +665,7 @@ impl Registry {
                 .iter()
                 .map(|guard| GuardView {
                     name: guard.name().to_owned(),
-                    r#type: guard.policy_kind(),
+                    r#type: guard.kind(),
                     roles: guard.required_roles().to_vec(),
                     insert_headers: guard
                         .insert_headers()
@@ -780,8 +781,8 @@ impl CompiledRoute {
 
         for reference in config.plugins.iter().flatten() {
             match lookup(plugins, &reference.name)? {
-                Plugin::Auth(policy) => {
-                    guards.push(RouteGuard::from_reference(reference, policy)?)
+                Plugin::Auth(plugin) => {
+                    guards.push(RouteGuard::from_reference(reference, plugin)?)
                 }
                 Plugin::Wasm(plugin) => {
                     filters.push(WasmFilter::from_reference(plugin, reference)?)
@@ -813,9 +814,10 @@ impl CompiledRoute {
 
         for requirement in &spec.plugins {
             match lookup(plugins, &requirement.name)? {
-                Plugin::Auth(policy) => guards.push(RouteGuard::build(
-                    &requirement.name,
-                    policy,
+                // The plugin carries its own declared name, so the guard and
+                // the registration cannot disagree about what it is called.
+                Plugin::Auth(plugin) => guards.push(RouteGuard::build(
+                    plugin,
                     requirement.roles.to_owned(),
                     requirement
                         .insert_headers
@@ -912,7 +914,7 @@ impl Pattern {
 /// silently leave a route unauthenticated or unfiltered.
 fn lookup(plugins: &HashMap<String, Plugin>, name: &str) -> Result<Plugin, String> {
     match plugins.get(name) {
-        Some(Plugin::Auth(policy)) => Ok(Plugin::Auth(policy.clone())),
+        Some(Plugin::Auth(plugin)) => Ok(Plugin::Auth(plugin.clone())),
         Some(Plugin::Wasm(plugin)) => Ok(Plugin::Wasm(plugin.clone())),
         None => Err(format!(
             "unknown plugin '{name}' (not defined in the gateway config)"
@@ -927,8 +929,8 @@ fn build_plugin(
     config: &PluginConfig,
     runtime: &mut Option<WasmRuntime>,
 ) -> Result<Plugin, String> {
-    if config.plugin_id != "wasm-plugin" {
-        return AuthPolicy::from_config(config).map(|policy| Plugin::Auth(Arc::new(policy)));
+    if config.plugin_id != wasm::KIND {
+        return plugins::build(config).map(Plugin::Auth);
     }
 
     let runtime = match runtime {

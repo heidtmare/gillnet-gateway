@@ -1,6 +1,11 @@
-//! WebAssembly plugin support.
+//! `wasm-plugin`: a WebAssembly module filters the request.
 //!
-//! A `wasm-plugin` entry in the `plugins:` block compiles one module once at
+//! The one plugin type that is not an [`AuthPlugin`](super::AuthPlugin). It
+//! runs after a route's guards have passed, so a module never sees a request
+//! the gateway was going to refuse, and it answers with header edits or a
+//! response of its own rather than with claims.
+//!
+//! An entry in the `plugins:` block compiles one module once at
 //! startup and gives it base settings. Routes reference it by name and may
 //! layer their own settings over that base; the merge happens at config time,
 //! so a request only pays for instantiation and the call itself.
@@ -24,6 +29,10 @@ use wasmtime::{Caller, Config, Engine, InstancePre, Linker, Module, Store, Store
 use yaml_serde::Value as Yaml;
 
 use crate::config::{PluginConfig, PluginReference};
+use crate::plugins;
+
+/// The `type:` a gateway config declares one of these with.
+pub const KIND: &str = "wasm-plugin";
 
 /// Exports a module must provide, and the one it may omit.
 const EXPORT_ALLOC: &str = "gillnet_alloc";
@@ -144,9 +153,9 @@ impl WasmRuntime {
     /// startup failure rather than a 500 on the first request that hits it.
     pub fn load(&self, config: &PluginConfig) -> Result<WasmPlugin, String> {
         let path = match config.params.get("path") {
-            Some(Yaml::String(path)) => PathBuf::from(expand(path)?),
-            Some(_) => return Err("wasm-plugin 'path' must be a string".to_owned()),
-            None => return Err("wasm-plugin requires 'path' to a .wasm module".to_owned()),
+            Some(Yaml::String(path)) => PathBuf::from(plugins::expand_env(path)?),
+            Some(_) => return Err(format!("{KIND} 'path' must be a string")),
+            None => return Err(format!("{KIND} requires 'path' to a .wasm module")),
         };
 
         let module = Module::from_file(&self.engine, &path).map_err(|error| {
@@ -175,14 +184,14 @@ impl WasmRuntime {
             module_path: path,
             instance_pre,
             engine: self.engine.clone(),
-            settings: settings_of(&config.params, "wasm-plugin")?,
-            fuel: number(&config.params, "fuel", DEFAULT_FUEL)?,
-            memory_max_bytes: number(
+            settings: settings_of(&config.params, KIND)?,
+            fuel: plugins::number(&config.params, "fuel", DEFAULT_FUEL)?,
+            memory_max_bytes: plugins::number(
                 &config.params,
                 "memory-max-bytes",
                 DEFAULT_MEMORY_MAX_BYTES as u64,
             )? as usize,
-            fail_open: flag(&config.params, "fail-open")?,
+            fail_open: plugins::flag(&config.params, "fail-open")?,
             has_response_phase,
         })
     }
@@ -210,7 +219,7 @@ fn host_functions(linker: &mut Linker<HostState>) -> Result<(), String> {
 
 impl WasmPlugin {
     pub fn kind(&self) -> &'static str {
-        "wasm-plugin"
+        KIND
     }
 
     pub fn module_path(&self) -> &std::path::Path {
@@ -233,13 +242,13 @@ impl WasmFilter {
 
         if params.contains_key("roles") || params.contains_key("insert-headers") {
             return Err(format!(
-                "plugin '{}' is a wasm-plugin; 'roles' and 'insert-headers' belong to auth \
+                "plugin '{}' is a {KIND}; 'roles' and 'insert-headers' belong to auth \
                  plugins, put per-route values under 'settings'",
                 reference.name
             ));
         }
 
-        Self::build(plugin, settings_of(&params, "wasm-plugin route reference")?)
+        Self::build(plugin, settings_of(&params, "a wasm-plugin route reference")?)
     }
 
     /// The self-registration path, where a service supplies settings directly.
@@ -609,29 +618,6 @@ fn settings_of(params: &HashMap<String, Yaml>, context: &str) -> Result<Json, St
         Ok(_) => Err(format!("{context} 'settings' must be a mapping")),
         Err(error) => Err(format!("{context} 'settings' is not representable as JSON: {error}")),
     }
-}
-
-fn number(params: &HashMap<String, Yaml>, key: &str, default: u64) -> Result<u64, String> {
-    match params.get(key) {
-        Some(value) => value
-            .as_u64()
-            .ok_or_else(|| format!("'{key}' must be a positive integer")),
-        None => Ok(default),
-    }
-}
-
-fn flag(params: &HashMap<String, Yaml>, key: &str) -> Result<bool, String> {
-    match params.get(key) {
-        Some(Yaml::Bool(value)) => Ok(*value),
-        Some(_) => Err(format!("'{key}' must be true or false")),
-        None => Ok(false),
-    }
-}
-
-/// `$VAR` in a module path, so a deployment can point at a mounted volume
-/// without a separate config file per environment.
-fn expand(raw: &str) -> Result<String, String> {
-    crate::auth::expand_env(raw)
 }
 
 fn read_memory(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {

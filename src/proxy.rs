@@ -10,7 +10,7 @@ use crate::auth::{self, AuthOutcome};
 use crate::config::ProxyConfig;
 use crate::registry::{Registry, Resolution, Resolved};
 use crate::testing::ClaimOverrides;
-use crate::wasm::{self, FilterOutcome, StopResponse, WasmFilter};
+use crate::plugins::wasm::{self, FilterOutcome, StopResponse, WasmFilter};
 use crate::websocket;
 
 /// Headers that apply to a single transport hop and must never be relayed.

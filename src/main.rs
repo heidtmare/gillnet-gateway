@@ -1,10 +1,10 @@
 mod api;
 mod auth;
 mod config;
+mod plugins;
 mod proxy;
 mod registry;
 mod testing;
-mod wasm;
 mod websocket;
 
 use std::sync::RwLock;
