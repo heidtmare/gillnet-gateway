@@ -4,7 +4,6 @@ mod config;
 mod plugins;
 mod proxy;
 mod registry;
-mod testing;
 mod websocket;
 
 use std::sync::RwLock;
@@ -16,7 +15,6 @@ use awc::{Client, Connector};
 
 use config::GatewayConfig;
 use registry::Registry;
-use testing::ClaimOverrides;
 
 #[actix_web::main]
 async fn main() -> Result<(), std::io::Error> {
@@ -31,12 +29,13 @@ async fn main() -> Result<(), std::io::Error> {
     let proxy_timeout = Duration::from_secs(config.proxy.timeout_seconds);
     let connect_timeout = Duration::from_secs(config.proxy.connect_timeout_seconds);
     let proxy_settings = config.proxy.clone();
-    let userinfo_overrides = config.testing.userinfo_overrides;
 
     let registry = web::Data::new(RwLock::new(Registry::from_config(&config)));
-    // Shared across workers rather than built per worker, so an override
-    // posted to one connection is visible to the next request on any other.
-    let overrides = web::Data::new(ClaimOverrides::default());
+
+    // Scopes the plugins asked for. Resolved once and shared, so every worker
+    // mounts the same routes over the same plugin state.
+    let endpoints = registry.read().unwrap().endpoints();
+    let testing_plugins = registry.read().unwrap().testing_plugins();
 
     actix_web::rt::spawn({
         let registry = registry.clone();
@@ -54,7 +53,7 @@ async fn main() -> Result<(), std::io::Error> {
 
     let proxy = HttpServer::new({
         let registry = registry.clone();
-        let overrides = overrides.clone();
+        let endpoints = endpoints.clone();
         move || {
             // One pooled client per worker thread; awc clients are not Send.
             let client = Client::builder()
@@ -65,12 +64,14 @@ async fn main() -> Result<(), std::io::Error> {
 
             let mut app = App::new()
                 .app_data(registry.clone())
-                .app_data(overrides.clone())
                 .app_data(web::Data::new(client))
                 .app_data(web::Data::new(proxy_settings.clone()));
 
-            if userinfo_overrides {
-                app = app.configure(testing::configure);
+            // Mounted before the catch-all, and so shadowing any configured
+            // route under the same prefix -- one more reason to leave a
+            // testing-plugin out of a production config.
+            for endpoint in &endpoints {
+                app = app.configure(|cfg| (endpoint.configure)(cfg));
             }
 
             app.default_service(web::to(proxy::handler))
@@ -90,11 +91,12 @@ async fn main() -> Result<(), std::io::Error> {
     .bind((host.as_str(), registration_port))?
     .run();
 
-    if userinfo_overrides {
+    for endpoint in endpoints.iter().filter(|e| testing_plugins.contains(&e.plugin)) {
         eprintln!(
-            "WARNING: testing.userinfo-overrides is enabled. /testing/userinfo is mounted on the\n\
-             public proxy port, and anyone who can reach it can mint any identity, including any\n\
-             role. Do not run this configuration in production."
+            "WARNING: plugin '{}' is a testing-plugin. It stands in for an authorization\n\
+             provider, and '{}' is mounted on the public proxy port -- anyone who can reach it\n\
+             can mint any identity, including any role. Do not run this in production.",
+            endpoint.plugin, endpoint.path
         );
     }
     println!("proxy listening on {host}:{proxy_port}");

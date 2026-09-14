@@ -13,7 +13,6 @@ use serde_json::Map;
 use crate::auth::AuthOutcome;
 use crate::config::PluginConfig;
 use crate::plugins::{self, AuthPlugin, Authenticating};
-use crate::testing::ClaimOverrides;
 
 pub const KIND: &str = "token-plugin";
 
@@ -58,12 +57,7 @@ impl AuthPlugin for TokenPlugin {
         None
     }
 
-    fn authenticate<'a>(
-        &'a self,
-        token: &'a str,
-        _client: &'a Client,
-        _overrides: &'a ClaimOverrides,
-    ) -> Authenticating<'a> {
+    fn authenticate<'a>(&'a self, token: &'a str, _client: &'a Client) -> Authenticating<'a> {
         let matched = self
             .tokens
             .iter()

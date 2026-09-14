@@ -14,7 +14,6 @@ use serde_json::{Map, Value as Json};
 use crate::auth::AuthOutcome;
 use crate::config::PluginConfig;
 use crate::plugins::{self, AuthPlugin, Authenticating};
-use crate::testing::ClaimOverrides;
 
 pub const KIND: &str = "jwt-plugin";
 
@@ -71,12 +70,7 @@ impl AuthPlugin for JwtPlugin {
         Some(&self.roles_claim)
     }
 
-    fn authenticate<'a>(
-        &'a self,
-        token: &'a str,
-        _client: &'a Client,
-        _overrides: &'a ClaimOverrides,
-    ) -> Authenticating<'a> {
+    fn authenticate<'a>(&'a self, token: &'a str, _client: &'a Client) -> Authenticating<'a> {
         let verified = decode::<Map<String, Json>>(token, &self.key, &self.validation)
             .map(|data| Arc::new(data.claims))
             .map_err(|error| {
@@ -115,14 +109,9 @@ mod tests {
     }
 
     fn verify(plugin: &JwtPlugin, token: &str) -> Result<Arc<Map<String, Json>>, AuthOutcome> {
-        let client = Client::default();
-        let overrides = ClaimOverrides::default();
-
-        futures_util::future::FutureExt::now_or_never(plugin.authenticate(
-            token,
-            &client,
-            &overrides,
-        ))
+        futures_util::future::FutureExt::now_or_never(
+            plugin.authenticate(token, &Client::default()),
+        )
         .expect("verification is synchronous and must resolve immediately")
     }
 

@@ -19,13 +19,13 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use actix_web::web;
 use awc::Client;
 use serde_json::{Map, Value as Json};
 use yaml_serde::Value as Yaml;
 
 use crate::auth::AuthOutcome;
 use crate::config::PluginConfig;
-use crate::testing::ClaimOverrides;
 
 // The file names match the `type:` strings they implement, which is worth one
 // `#[path]` each: a config says `type: jwt-plugin` and the code is in
@@ -34,6 +34,8 @@ use crate::testing::ClaimOverrides;
 pub mod jwt;
 #[path = "oauth2-plugin.rs"]
 pub mod oauth2;
+#[path = "testing-plugin.rs"]
+pub mod testing;
 #[path = "token-plugin.rs"]
 pub mod token;
 #[path = "wasm-plugin.rs"]
@@ -42,7 +44,13 @@ pub mod wasm;
 /// Every `type:` the gateway understands, in the order a config is likely to
 /// meet them. Assembled from the modules themselves so a new plugin appears in
 /// the error a typo produces without anyone remembering to add it.
-pub const KINDS: [&str; 4] = [token::KIND, jwt::KIND, oauth2::KIND, wasm::KIND];
+pub const KINDS: [&str; 5] = [
+    token::KIND,
+    jwt::KIND,
+    oauth2::KIND,
+    testing::KIND,
+    wasm::KIND,
+];
 
 /// One authentication plugin: the part of a route's auth that a plugin type
 /// owns, as opposed to the part a route configures.
@@ -70,12 +78,25 @@ pub trait AuthPlugin: Send + Sync {
     /// Verifies the credential and returns the claims it vouches for, or the
     /// outcome to send back. A plugin with no claims to offer returns an empty
     /// map rather than failing.
-    fn authenticate<'a>(
-        &'a self,
-        token: &'a str,
-        client: &'a Client,
-        overrides: &'a ClaimOverrides,
-    ) -> Authenticating<'a>;
+    fn authenticate<'a>(&'a self, token: &'a str, client: &'a Client) -> Authenticating<'a>;
+
+    /// HTTP endpoints this plugin needs mounted on the proxy listener. Almost
+    /// nothing wants this; `testing-plugin` does, because the claim sets it
+    /// serves have to be posted from somewhere.
+    fn endpoint(&self) -> Option<Endpoint> {
+        None
+    }
+}
+
+/// A scope a plugin asks the proxy listener to mount for it. The routes are a
+/// closure so a plugin can register whatever it likes without this module
+/// knowing what they are.
+#[derive(Clone)]
+pub struct Endpoint {
+    /// The plugin that asked for it, for the startup warning and `describe`.
+    pub plugin: String,
+    pub path: String,
+    pub configure: Arc<dyn Fn(&mut web::ServiceConfig) + Send + Sync>,
 }
 
 /// The future [`AuthPlugin::authenticate`] returns. Boxed because a trait with
@@ -92,6 +113,7 @@ pub fn build(config: &PluginConfig) -> Result<Arc<dyn AuthPlugin>, String> {
         token::KIND => token::build(config).map(into_plugin),
         jwt::KIND => jwt::build(config).map(into_plugin),
         oauth2::KIND => oauth2::build(config).map(into_plugin),
+        testing::KIND => testing::build(config).map(into_plugin),
         other => Err(format!(
             "unknown plugin type '{other}' (expected {})",
             known_kinds()

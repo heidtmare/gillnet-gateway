@@ -8,9 +8,8 @@ use awc::{Client, ClientResponse};
 
 use crate::auth::{self, AuthOutcome};
 use crate::config::ProxyConfig;
-use crate::registry::{Registry, Resolution, Resolved};
-use crate::testing::ClaimOverrides;
 use crate::plugins::wasm::{self, FilterOutcome, StopResponse, WasmFilter};
+use crate::registry::{Registry, Resolution, Resolved};
 use crate::websocket;
 
 /// Headers that apply to a single transport hop and must never be relayed.
@@ -33,7 +32,6 @@ pub async fn handler(
     registry: web::Data<RwLock<Registry>>,
     client: web::Data<Client>,
     settings: web::Data<ProxyConfig>,
-    overrides: web::Data<ClaimOverrides>,
 ) -> HttpResponse {
     let resolution = { registry.read().unwrap().resolve(req.path()) };
 
@@ -54,7 +52,7 @@ pub async fn handler(
         query => format!("{}?{}", resolved.target_url, query),
     };
 
-    let mut identity = match auth::enforce(&resolved.guards, req.headers(), &client, &overrides).await {
+    let mut identity = match auth::enforce(&resolved.guards, req.headers(), &client).await {
         AuthOutcome::Allowed(headers) => headers,
         AuthOutcome::Unauthorized(message) => {
             return HttpResponse::Unauthorized()

@@ -16,7 +16,6 @@ use yaml_serde::Value as Yaml;
 
 use crate::config::PluginReference;
 use crate::plugins::{self, AuthPlugin};
-use crate::testing::ClaimOverrides;
 
 /// One plugin as a single route uses it.
 #[derive(Clone)]
@@ -37,16 +36,11 @@ pub enum AuthOutcome {
 }
 
 /// Every guard on a route must pass; identity headers from all of them are merged.
-pub async fn enforce(
-    guards: &[RouteGuard],
-    headers: &HeaderMap,
-    client: &Client,
-    overrides: &ClaimOverrides,
-) -> AuthOutcome {
+pub async fn enforce(guards: &[RouteGuard], headers: &HeaderMap, client: &Client) -> AuthOutcome {
     let mut identity = Vec::new();
 
     for guard in guards {
-        match guard.check(headers, client, overrides).await {
+        match guard.check(headers, client).await {
             Ok(mut injected) => identity.append(&mut injected),
             Err(outcome) => return outcome,
         }
@@ -166,7 +160,6 @@ impl RouteGuard {
         &self,
         headers: &HeaderMap,
         client: &Client,
-        overrides: &ClaimOverrides,
     ) -> Result<Vec<(String, String)>, AuthOutcome> {
         let Some(token) = extract_token(headers, self.plugin.header_keys()) else {
             return Err(AuthOutcome::Unauthorized(format!(
@@ -175,7 +168,7 @@ impl RouteGuard {
             )));
         };
 
-        let claims = self.plugin.authenticate(&token, client, overrides).await?;
+        let claims = self.plugin.authenticate(&token, client).await?;
 
         self.authorize(&claims)?;
         self.render_identity(&claims)

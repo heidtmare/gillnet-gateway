@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::RouteGuard;
 use crate::config::{GatewayConfig, MatchType, PluginConfig, RouteConfig};
 use crate::plugins::wasm::{self, WasmFilter, WasmPlugin, WasmRuntime};
-use crate::plugins::{self, AuthPlugin};
+use crate::plugins::{self, AuthPlugin, Endpoint};
 
 pub struct Registry {
     static_routes: Vec<CompiledRoute>,
@@ -17,7 +17,6 @@ pub struct Registry {
     plugins: HashMap<String, Plugin>,
     services: HashMap<String, RegisteredService>,
     ttl: Duration,
-    userinfo_overrides: bool,
 }
 
 #[derive(Default)]
@@ -211,9 +210,10 @@ pub struct DescribeView {
 pub struct SummaryView {
     pub heartbeat_ttl_seconds: u64,
 
-    /// Surfaced so an operator can confirm at a glance that a production
-    /// gateway is not accepting test claim overrides.
-    pub testing_userinfo_overrides: bool,
+    /// Any `testing-plugin` declared, by name. Surfaced so an operator can
+    /// confirm at a glance that a production gateway is not standing in for
+    /// its authorization provider. Should always be empty in production.
+    pub testing_plugins: Vec<String>,
 
     pub services: usize,
     pub instances: usize,
@@ -229,6 +229,11 @@ pub struct PluginView {
     /// Where a wasm-plugin's module was loaded from. Omitted for the others.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub module: Option<String>,
+
+    /// Where a plugin that mounts its own routes serves them. Only a
+    /// testing-plugin does.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
     pub settings: Option<serde_json::Value>,
@@ -350,8 +355,45 @@ impl Registry {
             plugins,
             services: HashMap::new(),
             ttl: Duration::from_secs(config.registration.heartbeat_ttl_seconds),
-            userinfo_overrides: config.testing.userinfo_overrides,
         }
+    }
+
+    /// Scopes the declared plugins want mounted on the proxy listener. Two
+    /// plugins claiming one path is a startup error: the second would be
+    /// shadowed by the first and silently never serve anything.
+    pub fn endpoints(&self) -> Vec<Endpoint> {
+        let mut endpoints: Vec<Endpoint> = self
+            .plugins
+            .values()
+            .filter_map(|plugin| match plugin {
+                Plugin::Auth(auth) => auth.endpoint(),
+                Plugin::Wasm(_) => None,
+            })
+            .collect();
+        endpoints.sort_by(|a, b| a.plugin.cmp(&b.plugin));
+
+        for (index, endpoint) in endpoints.iter().enumerate() {
+            if let Some(clash) = endpoints[..index].iter().find(|e| e.path == endpoint.path) {
+                panic!(
+                    "Plugins '{}' and '{}' both mount '{}'!",
+                    clash.plugin, endpoint.plugin, endpoint.path
+                );
+            }
+        }
+
+        endpoints
+    }
+
+    /// Declared `testing-plugin`s, by name. Empty is what production looks like.
+    pub fn testing_plugins(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .plugins
+            .iter()
+            .filter(|(_, plugin)| plugin.kind() == plugins::testing::KIND)
+            .map(|(name, _)| name.to_owned())
+            .collect();
+        names.sort();
+        names
     }
 
     pub fn ttl_seconds(&self) -> u64 {
@@ -549,6 +591,10 @@ impl Registry {
                     Plugin::Wasm(wasm) => Some(wasm.module_path().display().to_string()),
                     Plugin::Auth(_) => None,
                 },
+                endpoint: match plugin {
+                    Plugin::Auth(auth) => auth.endpoint().map(|endpoint| endpoint.path),
+                    Plugin::Wasm(_) => None,
+                },
                 // Auth plugin params hold credentials and are never reported;
                 // wasm settings are plain configuration and are.
                 settings: match plugin {
@@ -562,7 +608,7 @@ impl Registry {
         DescribeView {
             summary: SummaryView {
                 heartbeat_ttl_seconds: self.ttl.as_secs(),
-                testing_userinfo_overrides: self.userinfo_overrides,
+                testing_plugins: self.testing_plugins(),
                 services: services.len(),
                 instances: services.iter().map(|s| s.instances.len()).sum(),
                 routes: routes.len(),

@@ -20,7 +20,6 @@ use sha2::{Digest, Sha256};
 use crate::auth::AuthOutcome;
 use crate::config::PluginConfig;
 use crate::plugins::{self, AuthPlugin, Authenticating};
-use crate::testing::ClaimOverrides;
 
 pub const KIND: &str = "oauth2-plugin";
 
@@ -95,13 +94,8 @@ impl AuthPlugin for OAuth2Plugin {
         Some(&self.roles_claim)
     }
 
-    fn authenticate<'a>(
-        &'a self,
-        token: &'a str,
-        client: &'a Client,
-        overrides: &'a ClaimOverrides,
-    ) -> Authenticating<'a> {
-        Box::pin(self.claims(token, client, overrides))
+    fn authenticate<'a>(&'a self, token: &'a str, client: &'a Client) -> Authenticating<'a> {
+        Box::pin(self.claims(token, client))
     }
 }
 
@@ -111,19 +105,7 @@ impl OAuth2Plugin {
         &self,
         token: &str,
         client: &Client,
-        overrides: &ClaimOverrides,
     ) -> Result<Arc<Map<String, Json>>, AuthOutcome> {
-        // A test override replaces the provider outright rather than being
-        // merged with it, so routes can be exercised with no IdP reachable.
-        // Overrides are never cached -- they are already in memory, and a
-        // cached copy would outlive a PATCH that changed them.
-        if let Some(claims) = overrides.get(token) {
-            if expired(&claims) {
-                return Err(rejected());
-            }
-            return Ok(claims);
-        }
-
         let key = Sha256::digest(token.as_bytes()).into();
 
         if let Some(cached) = self.cached(&key) {
