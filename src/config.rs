@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
-use serde_yaml::Value;
+use yaml_serde::Value;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

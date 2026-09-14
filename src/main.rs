@@ -15,7 +15,7 @@ use registry::{Registry, Resolution};
 async fn main() -> Result<(), std::io::Error> {
     let filename = env::args().nth(1).expect("No config file provided");
     let contents = fs::read_to_string(filename).expect("Could not read config file!");
-    let config: GatewayConfig = serde_yaml::from_str(&contents).expect("Invalid yaml!");
+    let config: GatewayConfig = yaml_serde::from_str(&contents).expect("Invalid yaml!");
 
     let host = config.listen.host.to_owned();
     let proxy_port = config.listen.proxy_port;
