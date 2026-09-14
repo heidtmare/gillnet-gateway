@@ -4,6 +4,13 @@
 //! unavailable and nothing to cache. The trade is that a token stays valid
 //! until it expires; there is no revocation. Use `oauth2-plugin` where that
 //! matters.
+//!
+//! A `cookie:` names a cookie the token may arrive in as well as a header,
+//! which is what makes a browser session work: an `oauth2-plugin` guarding the
+//! login route mints a cookie from what the provider said, and this verifies
+//! it on every route behind with the same secret and the same checks. Nothing
+//! here knows the cookie was minted rather than issued -- it is an HS256 token
+//! either way -- so there is no second code path to keep honest.
 
 use std::sync::Arc;
 
@@ -13,13 +20,14 @@ use serde_json::{Map, Value as Json};
 
 use crate::auth::AuthOutcome;
 use crate::config::PluginConfig;
-use crate::plugins::{self, AuthPlugin, Authenticating};
+use crate::plugins::{self, AuthPlugin, Authenticating, Credential};
 
 pub const KIND: &str = "jwt-plugin";
 
 pub struct JwtPlugin {
     name: String,
     header_keys: Vec<String>,
+    cookie_keys: Vec<String>,
     key: DecodingKey,
     validation: Validation,
     roles_claim: String,
@@ -46,6 +54,9 @@ pub fn build(config: &PluginConfig) -> Result<JwtPlugin, String> {
     Ok(JwtPlugin {
         name: config.name.to_owned(),
         header_keys: plugins::string_list(&config.params, "keys")?,
+        // Named rather than assumed: a gateway that mints no session has no
+        // business reading one out of a cookie a page happens to carry.
+        cookie_keys: plugins::string_list(&config.params, "cookie")?,
         key: DecodingKey::from_secret(secret.as_bytes()),
         validation,
         roles_claim: plugins::string(&config.params, "roles-claim")?
@@ -66,12 +77,20 @@ impl AuthPlugin for JwtPlugin {
         &self.header_keys
     }
 
+    fn cookie_keys(&self) -> &[String] {
+        &self.cookie_keys
+    }
+
     fn roles_claim(&self) -> Option<&str> {
         Some(&self.roles_claim)
     }
 
-    fn authenticate<'a>(&'a self, token: &'a str, _client: &'a Client) -> Authenticating<'a> {
-        let verified = decode::<Map<String, Json>>(token, &self.key, &self.validation)
+    fn authenticate<'a>(
+        &'a self,
+        credential: Credential<'a>,
+        _client: &'a Client,
+    ) -> Authenticating<'a> {
+        let verified = decode::<Map<String, Json>>(credential.token, &self.key, &self.validation)
             .map(|data| Arc::new(data.claims))
             .map_err(|error| {
                 AuthOutcome::Unauthorized(format!(
@@ -109,9 +128,13 @@ mod tests {
     }
 
     fn verify(plugin: &JwtPlugin, token: &str) -> Result<Arc<Map<String, Json>>, AuthOutcome> {
-        futures_util::future::FutureExt::now_or_never(
-            plugin.authenticate(token, &Client::default()),
-        )
+        futures_util::future::FutureExt::now_or_never(plugin.authenticate(
+            Credential {
+                token,
+                session: None,
+            },
+            &Client::default(),
+        ))
         .expect("verification is synchronous and must resolve immediately")
     }
 
@@ -179,6 +202,45 @@ mod tests {
 
         let other = plugin("{secret: shh, audience: something-else}").unwrap();
         assert!(verify(&other, &stamped).is_err());
+    }
+
+    #[test]
+    fn a_cookie_is_read_only_when_one_is_named() {
+        assert!(plugin("secret: shh").unwrap().cookie_keys().is_empty());
+        assert_eq!(
+            plugin("{secret: shh, cookie: gillnet-session}")
+                .unwrap()
+                .cookie_keys(),
+            ["gillnet-session"]
+        );
+    }
+
+    #[test]
+    fn a_minted_session_cookie_verifies_like_any_other_token() {
+        // The whole point of the seam: what `oauth2-plugin` mints is an HS256
+        // token, so this verifies it with no knowledge that a cookie exists.
+        let minting = crate::plugins::session::build(
+            &yaml_serde::from_str("session-cookie: {secret: shh, issuer: 'https://gw'}").unwrap(),
+            "test",
+        )
+        .unwrap()
+        .unwrap();
+
+        let issued = minting.issue(
+            Credential {
+                token: "opaque-provider-token",
+                session: None,
+            },
+            &json!({"sub": "u1", "roles": ["admin"]}).as_object().unwrap().to_owned(),
+        );
+        let set_cookie = &issued[0].1;
+        let cookie = set_cookie.split(';').next().unwrap().split_once('=').unwrap().1;
+
+        let plugin = plugin("{secret: shh, issuer: 'https://gw', cookie: gillnet-session}").unwrap();
+        let claims = verify(&plugin, cookie).expect("a minted session must verify");
+
+        assert_eq!(claims["sub"], json!("u1"));
+        assert_eq!(claims["roles"], json!(["admin"]));
     }
 
     #[test]

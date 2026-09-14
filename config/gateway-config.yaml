@@ -42,6 +42,14 @@ plugins:
       # issuer: https://auth.example.com
       # audience: gillnet
       roles-claim: roles
+      # Also accept the token out of this cookie, after Authorization and any
+      # `keys:` header. This is the other half of the oauth-plugin's
+      # `session-cookie:` below: same secret, same issuer/audience checks, so a
+      # browser that logged in once at the oauth-guarded route reaches these
+      # routes without another introspection call. The cookie is stripped from
+      # the forwarded `Cookie` header -- and only that cookie; the rest of the
+      # jar is the application's and goes through untouched.
+      cookie: gillnet-session
 
   # Asks an external provider about each token (RFC 7662 introspection, then
   # UserInfo for profile claims). Results are cached until the token's own exp,
@@ -59,6 +67,35 @@ plugins:
       cache-max-seconds: 60
       cache-negative-seconds: 5
       cache-max-entries: 10000
+      # Hand the caller a session once the provider has vouched for them. The
+      # cookie holds the verified claims as an HS256 token, so `my-jwt-plugin`
+      # above verifies it with no second format and no call to anyone. Omit the
+      # whole block and no cookie is ever set.
+      #
+      # The trade is the one jwt-plugin always makes: a session is not
+      # revocable, so ttl-seconds is the window in which a revoked token still
+      # opens the routes guarded by the jwt-plugin. It is capped by the token's
+      # own exp -- a session never outlives the credential it came from -- and
+      # routes that cannot tolerate the gap should keep the oauth2-plugin,
+      # which asks the provider every time and never accepts this cookie back.
+      session-cookie:
+        # Must be the jwt-plugin's `secret:`, or nothing can read what this mints.
+        secret: $JWT_SECRET
+        name: gillnet-session
+        ttl-seconds: 3600
+        path: /
+        # domain: example.com
+        # Both default to true; a session is HttpOnly and Secure unless a
+        # config says otherwise.
+        secure: true
+        http-only: true
+        # Strict, Lax (default) or None. None requires secure: true, since a
+        # browser would otherwise discard the cookie outright.
+        same-site: Lax
+        # Stamped into the minted token, to satisfy a jwt-plugin that enforces
+        # them. Leave out if it does not.
+        # issuer: https://auth.example.com
+        # audience: gillnet
 
   # Test scaffolding. MUST NOT appear in a production config.
   #
@@ -96,6 +133,21 @@ plugins:
   #     # Match the plugin being stood in for, so routes behave identically.
   #     roles-claim: scope
   #     keys: [api-key]
+  #     # Stands in for the oauth-plugin's session too: same block, same cookie,
+  #     # so the jwt-guarded routes behind a login work with no IdP reachable.
+  #     #
+  #     # Unlike the real thing this also reads the cookie back, and reads it as
+  #     # a BASELINE: the claims in the session, with whatever was registered
+  #     # for the token layered over them. So a test logs in once and then
+  #     # varies one claim -- POST {"token": "...", "claims": {"scope": "admin"}}
+  #     # -- and the rest of the identity keeps coming from the cookie. A past
+  #     # `exp` registered this way ends a live session on the spot.
+  #     #
+  #     # A cookie it did not sign is still refused: the endpoints are the way
+  #     # to mint an identity here, not a handmade cookie.
+  #     session-cookie:
+  #       secret: $JWT_SECRET
+  #       name: gillnet-session
 
   # A WebAssembly filter. The module is compiled once at startup; a missing
   # file or a module that does not export the ABI is a startup failure, not a
@@ -136,9 +188,11 @@ plugins:
 
 # Static routes.
 #
-# A guarded route strips the credential it authenticated with -- Authorization
-# and any header named in the plugin's `keys:` -- before forwarding, so a
-# backend is never handed a token it could replay elsewhere. Set
+# A guarded route strips the credential it authenticated with -- Authorization,
+# any header named in the plugin's `keys:`, and any cookie named in its
+# `cookie:` or `session-cookie:` -- before forwarding, so a backend is never
+# handed a token it could replay elsewhere. Cookies go one at a time: the rest
+# of the jar belongs to the application and is forwarded untouched. Set
 # `forward-token: true` on routes whose backend genuinely needs it (it wants to
 # read claims itself, or it calls another API on the user's behalf).
 # Unguarded routes are untouched pass-throughs; there is no credential the
@@ -148,6 +202,17 @@ plugins:
 # resolved against static `services:` first, then the self-registration registry —
 # so a static route can point at a name that pods fill in at runtime.
 routes:
+  # The door. A caller arrives with a provider token, the oauth-plugin asks the
+  # provider about it, and the response carries back a session cookie -- after
+  # which the jwt-guarded routes below open to the same browser with no further
+  # introspection. Guarded by the oauth-plugin rather than the jwt-plugin on
+  # purpose: this is the one route where the provider is asked every time.
+  # - name: login-route
+  #   url: my-application-svc
+  #   paths: [/login]
+  #   plugins:
+  #     - name: my-oauth-plugin
+
   - name: ui-route
     url: "http://my-application-ui.local:8080"
     paths: [/index, /home, /landing]

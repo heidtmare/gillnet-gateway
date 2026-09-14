@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::RwLock;
 
 use actix_web::body::SizedStream;
@@ -8,6 +9,7 @@ use awc::{Client, ClientResponse};
 
 use crate::auth::{self, AuthOutcome};
 use crate::config::ProxyConfig;
+use crate::plugins::session;
 use crate::plugins::wasm::{self, FilterOutcome, StopResponse, WasmFilter};
 use crate::registry::{Registry, Resolution, Resolved};
 use crate::websocket;
@@ -25,6 +27,42 @@ const HOP_BY_HOP: [&str; 9] = [
     "transfer-encoding",
     "upgrade",
 ];
+
+/// What the guards and filters decided about a request's headers, in both
+/// directions. One value rather than four arguments because the websocket path
+/// has to honour exactly the same decisions the plain HTTP path does.
+pub(crate) struct Forwarding {
+    /// Set on the way upstream: identity rendered from verified claims, plus
+    /// whatever a filter added.
+    identity: Vec<(String, String)>,
+
+    /// Header names whose client-sent copy must not reach the upstream.
+    blocked: HashSet<String>,
+
+    /// Cookies to take out of the forwarded jar, leaving the rest of it alone.
+    cookies: HashSet<String>,
+
+    /// Added to the response on the way back -- the session a guard minted.
+    response: Vec<(String, String)>,
+}
+
+impl Forwarding {
+    pub(crate) fn identity(&self) -> &[(String, String)] {
+        &self.identity
+    }
+
+    pub(crate) fn blocked(&self) -> &HashSet<String> {
+        &self.blocked
+    }
+
+    pub(crate) fn cookies(&self) -> &HashSet<String> {
+        &self.cookies
+    }
+
+    pub(crate) fn response(&self) -> &[(String, String)] {
+        &self.response
+    }
+}
 
 pub async fn handler(
     req: HttpRequest,
@@ -52,8 +90,8 @@ pub async fn handler(
         query => format!("{}?{}", resolved.target_url, query),
     };
 
-    let mut identity = match auth::enforce(&resolved.guards, req.headers(), &client).await {
-        AuthOutcome::Allowed(headers) => headers,
+    let allowed = match auth::enforce(&resolved.guards, req.headers(), &client).await {
+        AuthOutcome::Allowed(allowed) => allowed,
         AuthOutcome::Unauthorized(message) => {
             return HttpResponse::Unauthorized()
                 .insert_header(("www-authenticate", "Bearer"))
@@ -73,9 +111,19 @@ pub async fn handler(
     // otherwise send itself to impersonate a user to a backend that trusts
     // them; and, unless the route opted into forward-token, the credential the
     // guards just consumed, which the backend has no need to hold.
-    let mut blocked = auth::injected_header_names(&resolved.guards);
+    let mut forwarding = Forwarding {
+        identity: allowed.identity,
+        blocked: auth::injected_header_names(&resolved.guards),
+        // The cookie jar is the exception: it holds the application's cookies
+        // as well as ours, so it is edited rather than blocked outright.
+        cookies: HashSet::new(),
+        response: allowed.response,
+    };
     if !resolved.forward_token {
-        blocked.extend(auth::credential_header_names(&resolved.guards));
+        forwarding
+            .blocked
+            .extend(auth::credential_header_names(&resolved.guards));
+        forwarding.cookies = auth::credential_cookie_names(&resolved.guards);
     }
 
     // WebAssembly filters run only once the guards have passed, so a module
@@ -103,9 +151,11 @@ pub async fn handler(
     };
     // A header a filter set is the gateway's, not the client's: any copy the
     // client sent is dropped, exactly as for auth-injected identity headers.
-    blocked.extend(edits.remove);
-    blocked.extend(edits.set.iter().map(|(name, _)| name.to_owned()));
-    identity.extend(edits.set);
+    forwarding.blocked.extend(edits.remove);
+    forwarding
+        .blocked
+        .extend(edits.set.iter().map(|(name, _)| name.to_owned()));
+    forwarding.identity.extend(edits.set);
 
     if websocket::is_upgrade(req.headers()) {
         return websocket::proxy(
@@ -115,8 +165,7 @@ pub async fn handler(
             &resolved,
             &target,
             settings.websocket_max_frame_bytes,
-            &identity,
-            &blocked,
+            &forwarding,
         )
         .await;
     }
@@ -136,8 +185,16 @@ pub async fn handler(
             || name == "host"
             || name == "content-length"
             || name.as_str().starts_with("x-forwarded-")
-            || blocked.contains(name.as_str())
+            || forwarding.blocked.contains(name.as_str())
         {
+            continue;
+        }
+        if name == "cookie" && !forwarding.cookies.is_empty() {
+            // Our session cookie comes out; the application's cookies go on.
+            match forwarded_jar(value, &forwarding.cookies) {
+                Some(jar) => upstream = upstream.append_header(("cookie", jar)),
+                None => continue,
+            }
             continue;
         }
         upstream = upstream.append_header((name.clone(), value.clone()));
@@ -149,7 +206,7 @@ pub async fn handler(
     upstream = upstream.insert_header(("x-forwarded-proto", scheme));
     upstream = upstream.insert_header(("x-forwarded-host", host));
 
-    for (header, value) in &identity {
+    for (header, value) in &forwarding.identity {
         upstream = upstream.insert_header((header.as_str(), value.as_str()));
     }
 
@@ -161,7 +218,12 @@ pub async fn handler(
     };
 
     match sent {
-        Ok(response) => relay(response, &resolved.filters, &resolved.route),
+        Ok(response) => relay(
+            response,
+            &resolved.filters,
+            &resolved.route,
+            &forwarding.response,
+        ),
         Err(error) => {
             eprintln!(
                 "upstream request failed: route={} source={} service={} instance={} target={target} error={error}",
@@ -175,7 +237,12 @@ pub async fn handler(
     }
 }
 
-fn relay<S>(response: ClientResponse<S>, filters: &[WasmFilter], route: &str) -> HttpResponse
+fn relay<S>(
+    response: ClientResponse<S>,
+    filters: &[WasmFilter],
+    route: &str,
+    from_guards: &[(String, String)],
+) -> HttpResponse
 where
     S: futures_util::Stream<Item = Result<bytes::Bytes, awc::error::PayloadError>> + Unpin + 'static,
 {
@@ -199,6 +266,11 @@ where
     }
     for (name, value) in edits.set {
         builder.insert_header((name, value));
+    }
+    // Appended last and never inserted: a `Set-Cookie` the guards minted has
+    // to sit alongside any the upstream sent, not replace it.
+    for (name, value) in from_guards {
+        builder.append_header((name.as_str(), value.as_str()));
     }
     builder.streaming(response)
 }
@@ -246,6 +318,19 @@ pub(crate) fn forwarded_for(req: &HttpRequest) -> Option<String> {
         (Some(existing), None) => Some(existing.to_owned()),
         (None, peer) => peer,
     }
+}
+
+/// The `Cookie:` header as the upstream should see it, or `None` when the
+/// gateway's own cookies were all it held.
+///
+/// A jar that is not valid UTF-8 is forwarded untouched: it cannot hold a
+/// cookie any guard here read, so there is nothing in it to withhold.
+fn forwarded_jar(value: &HeaderValue, consumed: &HashSet<String>) -> Option<HeaderValue> {
+    let Ok(jar) = value.to_str() else {
+        return Some(value.clone());
+    };
+
+    session::without(jar, consumed).and_then(|jar| HeaderValue::from_str(&jar).ok())
 }
 
 fn content_length(headers: &HeaderMap) -> Option<u64> {

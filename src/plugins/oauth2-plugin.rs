@@ -6,6 +6,15 @@
 //! `cache-max-seconds`. When the provider cannot be reached the request is
 //! refused with 503 rather than guessed at: the token may well be valid, but
 //! nothing here can confirm it.
+//!
+//! A `session-cookie:` turns that answer into something a browser can carry.
+//! Once the provider has vouched for a caller, this hands back a `Set-Cookie`
+//! holding the claims as an HS256 token, which a `jwt-plugin` on the routes
+//! behind verifies without asking anyone -- so a login route pays for
+//! introspection and the pages after it do not. The cookie is never accepted
+//! back *here*: this plugin exists to ask the provider, and a route guarded by
+//! it keeps asking. Where the answer stops mattering for an hour is a decision
+//! the config makes by putting a `jwt-plugin` on the route instead.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -19,7 +28,8 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::AuthOutcome;
 use crate::config::PluginConfig;
-use crate::plugins::{self, AuthPlugin, Authenticating};
+use crate::plugins::session::SessionCookie;
+use crate::plugins::{self, AuthPlugin, Authenticating, Credential};
 
 pub const KIND: &str = "oauth2-plugin";
 
@@ -35,6 +45,7 @@ pub struct OAuth2Plugin {
     cache_negative: Duration,
     cache_max_entries: usize,
     cache: Mutex<HashMap<[u8; 32], CacheEntry>>,
+    session: Option<SessionCookie>,
 }
 
 struct CacheEntry {
@@ -74,6 +85,7 @@ pub fn build(config: &PluginConfig) -> Result<OAuth2Plugin, String> {
         cache_negative: Duration::from_secs(plugins::number(params, "cache-negative-seconds", 5)?),
         cache_max_entries: plugins::number(params, "cache-max-entries", 10_000)? as usize,
         cache: Mutex::new(HashMap::new()),
+        session: plugins::session::build(params, KIND)?,
     })
 }
 
@@ -94,8 +106,19 @@ impl AuthPlugin for OAuth2Plugin {
         Some(&self.roles_claim)
     }
 
-    fn authenticate<'a>(&'a self, token: &'a str, client: &'a Client) -> Authenticating<'a> {
-        Box::pin(self.claims(token, client))
+    /// Minted, never accepted: `cookie_keys` stays empty on purpose. A route
+    /// guarded by this plugin asks the provider every time, which is the only
+    /// reason to choose it over `jwt-plugin` in the first place.
+    fn session_cookie(&self) -> Option<&SessionCookie> {
+        self.session.as_ref()
+    }
+
+    fn authenticate<'a>(
+        &'a self,
+        credential: Credential<'a>,
+        client: &'a Client,
+    ) -> Authenticating<'a> {
+        Box::pin(self.claims(credential.token, client))
     }
 }
 
@@ -308,6 +331,43 @@ mod tests {
 
         let params = format!("{{{}, roles-claim: roles}}", complete().trim_matches(['{', '}']));
         assert_eq!(plugin(&params).unwrap().roles_claim(), Some("roles"));
+    }
+
+    #[test]
+    fn a_session_cookie_is_minted_only_when_one_is_configured() {
+        assert!(plugin(complete()).unwrap().session_cookie().is_none());
+
+        let params = format!(
+            "{{{}, session-cookie: {{secret: shh, name: sid}}}}",
+            complete().trim_matches(['{', '}'])
+        );
+        let plugin = plugin(&params).unwrap();
+        let cookie = plugin.session_cookie().expect("a configured cookie is minted");
+        assert_eq!(cookie.name(), "sid");
+
+        // What the provider vouched for is what the browser carries away.
+        let issued = plugin.issue(
+            Credential {
+                token: "opaque-provider-token",
+                session: None,
+            },
+            &claims(json!({"sub": "u1", "scope": "admin", "active": true})),
+        );
+        assert_eq!(issued.len(), 1);
+        assert_eq!(issued[0].0, "set-cookie");
+        assert!(issued[0].1.starts_with("sid="), "{}", issued[0].1);
+    }
+
+    #[test]
+    fn the_cookie_it_mints_is_not_a_credential_it_accepts() {
+        let params = format!(
+            "{{{}, session-cookie: {{secret: shh}}}}",
+            complete().trim_matches(['{', '}'])
+        );
+
+        // Otherwise a session would let a caller past the one plugin whose
+        // whole job is to ask the provider again.
+        assert!(plugin(&params).unwrap().cookie_keys().is_empty());
     }
 
     #[test]

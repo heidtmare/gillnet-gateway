@@ -295,6 +295,15 @@ pub struct GuardView {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub insert_headers: HashMap<String, String>,
 
+    /// Cookies this plugin reads a credential out of, and the one it mints.
+    /// Both are worth seeing: the first says a route can be entered with a
+    /// browser session, the second says it hands one out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub cookie_keys: Vec<String>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_cookie: Option<String>,
+
     /// The plugin's base settings with this route's merged over them -- what
     /// the module will actually be handed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -718,6 +727,8 @@ impl Registry {
                         .iter()
                         .map(|(header, template)| (header.to_owned(), template.to_owned()))
                         .collect(),
+                    cookie_keys: guard.cookie_keys().to_vec(),
+                    session_cookie: guard.session_cookie().map(str::to_owned),
                     settings: None,
                 })
                 .chain(route.filters.iter().map(|filter| GuardView {
@@ -725,6 +736,8 @@ impl Registry {
                     r#type: filter.kind(),
                     roles: Vec::new(),
                     insert_headers: HashMap::new(),
+                    cookie_keys: Vec::new(),
+                    session_cookie: None,
                     settings: Some(filter.settings().clone()),
                 }))
                 .collect(),

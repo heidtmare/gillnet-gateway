@@ -22,6 +22,15 @@
 //!
 //! `id` is the token's SHA-256, so it can be pasted around safely. An `exp`
 //! claim in the past is still honoured, which is how expiry gets tested.
+//!
+//! Standing in for an `oauth2-plugin` means standing in for its session cookie
+//! too, so this takes the same `session-cookie:` block and mints the same
+//! thing. A request already carrying one is read as the *baseline* it starts
+//! from: the claims in the cookie, with whatever was registered for the token
+//! layered over them. That is what lets a test log in once and then change one
+//! claim -- add a role, expire the session, drop an email -- without restating
+//! the identity each time, and it is why a route with a cookie in place works
+//! here with nothing registered at all.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -34,7 +43,8 @@ use sha2::{Digest, Sha256};
 
 use crate::auth::AuthOutcome;
 use crate::config::PluginConfig;
-use crate::plugins::{self, AuthPlugin, Authenticating, Endpoint};
+use crate::plugins::session::SessionCookie;
+use crate::plugins::{self, AuthPlugin, Authenticating, Credential, Endpoint};
 
 pub const KIND: &str = "testing-plugin";
 
@@ -43,8 +53,10 @@ const DEFAULT_ENDPOINT: &str = "/testing/userinfo";
 pub struct TestingPlugin {
     name: String,
     header_keys: Vec<String>,
+    cookie_keys: Vec<String>,
     roles_claim: String,
     endpoint: String,
+    session: Option<SessionCookie>,
     overrides: Arc<ClaimOverrides>,
 }
 
@@ -56,14 +68,24 @@ pub fn build(config: &PluginConfig) -> Result<TestingPlugin, String> {
         return Err(format!("{KIND} 'endpoint' must start with '/'"));
     }
 
+    let session = plugins::session::build(&config.params, KIND)?;
+
     Ok(TestingPlugin {
         name: config.name.to_owned(),
         header_keys: plugins::string_list(&config.params, "keys")?,
+        // Unlike the oauth2-plugin it stands in for, this *does* accept its own
+        // cookie back: there is no provider to ask, so a live session is the
+        // only identity a browser has once the login response is behind it.
+        cookie_keys: session
+            .as_ref()
+            .map(|cookie| vec![cookie.name().to_owned()])
+            .unwrap_or_default(),
         // Defaults to the oauth2-plugin's claim, which is what this most often
         // stands in for.
         roles_claim: plugins::string(&config.params, "roles-claim")?
             .unwrap_or_else(|| "scope".to_owned()),
         endpoint,
+        session,
         overrides: Arc::new(ClaimOverrides::default()),
     })
 }
@@ -81,18 +103,24 @@ impl AuthPlugin for TestingPlugin {
         &self.header_keys
     }
 
+    fn cookie_keys(&self) -> &[String] {
+        &self.cookie_keys
+    }
+
+    fn session_cookie(&self) -> Option<&SessionCookie> {
+        self.session.as_ref()
+    }
+
     fn roles_claim(&self) -> Option<&str> {
         Some(&self.roles_claim)
     }
 
-    fn authenticate<'a>(&'a self, token: &'a str, _client: &'a Client) -> Authenticating<'a> {
-        let outcome = match self.overrides.get(token) {
-            // Honoured rather than ignored: a past `exp` is how expiry is
-            // tested, and it has to behave the way a real provider's would.
-            Some(claims) if expired(&claims) => Err(rejected()),
-            Some(claims) => Ok(claims),
-            None => Err(rejected()),
-        };
+    fn authenticate<'a>(
+        &'a self,
+        credential: Credential<'a>,
+        _client: &'a Client,
+    ) -> Authenticating<'a> {
+        let outcome = self.resolve(credential);
 
         Box::pin(async move { outcome })
     }
@@ -121,6 +149,45 @@ impl AuthPlugin for TestingPlugin {
                 );
             }),
         })
+    }
+}
+
+impl TestingPlugin {
+    /// The identity a request presents: the session it already holds, with
+    /// anything registered for its token layered over the top.
+    ///
+    /// The layering is the useful part. A test that has logged in and wants to
+    /// try one more role registers that one claim against the token, and the
+    /// rest of the identity keeps coming from the cookie -- so what is being
+    /// varied is visible in the test rather than buried in a full claim set
+    /// restated for the occasion.
+    fn resolve(&self, credential: Credential<'_>) -> Result<Arc<Map<String, Json>>, AuthOutcome> {
+        let baseline = credential
+            .session
+            .zip(self.session.as_ref())
+            .and_then(|(cookie, session)| session.claims(cookie));
+        let registered = self.overrides.get(credential.token);
+
+        let claims = match (baseline, registered) {
+            // Nothing vouches for this caller, which is what an unknown token
+            // means when there is no provider to fall back to.
+            (None, None) => return Err(rejected()),
+            (None, Some(registered)) => registered,
+            (Some(baseline), None) => Arc::new(baseline),
+            (Some(mut baseline), Some(registered)) => {
+                baseline.extend((*registered).clone());
+                Arc::new(baseline)
+            }
+        };
+
+        // Honoured rather than ignored: a past `exp` is how expiry is tested,
+        // and it has to behave the way a real provider's would. Registering
+        // `exp` against a token is therefore how a live session is expired
+        // mid-test without waiting for the cookie to run out.
+        if expired(&claims) {
+            return Err(rejected());
+        }
+        Ok(claims)
     }
 }
 
@@ -394,10 +461,41 @@ mod tests {
     }
 
     fn verify(plugin: &TestingPlugin, token: &str) -> Result<Arc<Map<String, Json>>, AuthOutcome> {
+        with_session(plugin, token, None)
+    }
+
+    fn with_session(
+        plugin: &TestingPlugin,
+        token: &str,
+        session: Option<&str>,
+    ) -> Result<Arc<Map<String, Json>>, AuthOutcome> {
         plugin
-            .authenticate(token, &Client::default())
+            .authenticate(Credential { token, session }, &Client::default())
             .now_or_never()
             .expect("a lookup is synchronous and must resolve immediately")
+    }
+
+    /// Logs an identity in the way the plugin itself would, and hands back the
+    /// cookie value a browser would then carry.
+    fn login(plugin: &TestingPlugin, claims: Json) -> String {
+        let issued = plugin.issue(
+            Credential {
+                token: "opaque",
+                session: None,
+            },
+            claims.as_object().unwrap(),
+        );
+        assert_eq!(issued.len(), 1, "a configured cookie must be minted");
+
+        issued[0]
+            .1
+            .split(';')
+            .next()
+            .unwrap()
+            .split_once('=')
+            .unwrap()
+            .1
+            .to_owned()
     }
 
     fn far_future() -> i64 {
@@ -456,6 +554,74 @@ mod tests {
 
         assert!(verify(&plugin, "live").is_ok());
         assert!(verify(&plugin, "dead").is_err());
+    }
+
+    #[test]
+    fn a_session_already_in_place_is_the_identity_on_its_own() {
+        let plugin = plugin("session-cookie: {secret: shh}").unwrap();
+        let cookie = login(&plugin, json!({"sub": "u1", "scope": "admin"}));
+
+        // Nothing registered for this token: the cookie is all there is, and
+        // it is enough. A route behind a login works with no setup at all.
+        let verified = with_session(&plugin, &cookie, Some(&cookie))
+            .expect("a live session must authenticate");
+
+        assert_eq!(verified["sub"], json!("u1"));
+        assert_eq!(verified["scope"], json!("admin"));
+    }
+
+    #[test]
+    fn a_registered_claim_is_layered_over_the_session_it_arrives_with() {
+        let plugin = plugin("session-cookie: {secret: shh}").unwrap();
+        let cookie = login(&plugin, json!({"sub": "u1", "email": "a@b.c", "scope": "user"}));
+
+        // The test varies one claim; the rest of the identity keeps coming
+        // from the session, whatever credential the token came from.
+        plugin.overrides.put("t", claims(json!({"scope": "admin"})));
+        let verified =
+            with_session(&plugin, "t", Some(&cookie)).expect("the session is the baseline");
+
+        assert_eq!(verified["scope"], json!("admin"));
+        assert_eq!(verified["sub"], json!("u1"));
+        assert_eq!(verified["email"], json!("a@b.c"));
+    }
+
+    #[test]
+    fn a_registered_expiry_ends_a_live_session() {
+        let plugin = plugin("session-cookie: {secret: shh}").unwrap();
+        let cookie = login(&plugin, json!({"sub": "u1"}));
+
+        assert!(with_session(&plugin, &cookie, Some(&cookie)).is_ok());
+
+        // Expiring the session is a one-claim override, not a wait.
+        plugin.overrides.put(&cookie, claims(json!({"exp": 1})));
+        assert!(matches!(
+            with_session(&plugin, &cookie, Some(&cookie)),
+            Err(AuthOutcome::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn a_cookie_this_plugin_did_not_mint_is_not_an_identity() {
+        let forger = plugin("session-cookie: {secret: guessed}").unwrap();
+        let cookie = login(&forger, json!({"sub": "admin", "scope": "admin"}));
+        let plugin = plugin("session-cookie: {secret: shh}").unwrap();
+
+        // Test scaffolding still checks a signature: the endpoints are the
+        // documented way to mint an identity, a handmade cookie is not.
+        assert!(matches!(
+            with_session(&plugin, &cookie, Some(&cookie)),
+            Err(AuthOutcome::Unauthorized(_))
+        ));
+    }
+
+    #[test]
+    fn without_a_configured_cookie_there_is_no_session_to_read() {
+        let plugin = plugin("{}").unwrap();
+
+        assert!(plugin.session_cookie().is_none());
+        assert!(plugin.cookie_keys().is_empty());
+        assert!(with_session(&plugin, "t", Some("anything")).is_err());
     }
 
     #[test]

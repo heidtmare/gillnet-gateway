@@ -10,6 +10,12 @@
 //! request the guards have already cleared, dispatched by the registry because
 //! it needs the shared WebAssembly engine.
 //!
+//! [`session`] is the seam between two of them. An `oauth2-plugin` that has
+//! asked the provider once mints a cookie saying so, and a `jwt-plugin` on
+//! another route verifies that cookie the way it verifies any other token --
+//! so a browser pays for introspection at the door and not on every request
+//! behind it.
+//!
 //! What stays out here is anything a *route* decides rather than a plugin:
 //! required roles and `insert-headers` belong to [`crate::auth::RouteGuard`],
 //! which wraps a plugin with the bindings one route gave it.
@@ -41,6 +47,11 @@ pub mod token;
 #[path = "wasm-plugin.rs"]
 pub mod wasm;
 
+// Not a `type:` of its own, so no `#[path]`: the session cookie two plugins
+// share, factored out so the one that mints it and the one that reads it
+// cannot drift apart on a flag or a claim.
+pub mod session;
+
 /// Every `type:` the gateway understands, in the order a config is likely to
 /// meet them. Assembled from the modules themselves so a new plugin appears in
 /// the error a typo produces without anyone remembering to add it.
@@ -70,6 +81,24 @@ pub trait AuthPlugin: Send + Sync {
     /// route opted into `forward-token`.
     fn header_keys(&self) -> &[String];
 
+    /// Cookies this plugin will read a credential out of, tried after every
+    /// header. Stripped from the forwarded `Cookie` header on the same terms
+    /// as [`AuthPlugin::header_keys`], leaving the request's other cookies
+    /// alone -- a session cookie is the gateway's business, the rest are the
+    /// application's.
+    fn cookie_keys(&self) -> &[String] {
+        &[]
+    }
+
+    /// The session cookie this plugin *mints*, if it mints one. Reported
+    /// separately from [`AuthPlugin::cookie_keys`] because minting and
+    /// accepting are different things: an `oauth2-plugin` issues a cookie it
+    /// will never take back as a credential, since only the provider gets to
+    /// say whether a token is still live.
+    fn session_cookie(&self) -> Option<&session::SessionCookie> {
+        None
+    }
+
     /// Which claim holds the caller's roles, or `None` for a plugin that
     /// confirms a credential without learning anything about who presented it.
     /// A route cannot require roles of a plugin that answers `None`.
@@ -78,7 +107,23 @@ pub trait AuthPlugin: Send + Sync {
     /// Verifies the credential and returns the claims it vouches for, or the
     /// outcome to send back. A plugin with no claims to offer returns an empty
     /// map rather than failing.
-    fn authenticate<'a>(&'a self, token: &'a str, client: &'a Client) -> Authenticating<'a>;
+    fn authenticate<'a>(&'a self, credential: Credential<'a>, client: &'a Client)
+        -> Authenticating<'a>;
+
+    /// Response headers to add on the way back, now that this plugin has
+    /// verified who is calling -- in practice the `Set-Cookie` that starts a
+    /// session. Handed the credential as well as the claims so a plugin can
+    /// decline to re-issue a cookie the request already carries.
+    fn issue<'a>(
+        &self,
+        credential: Credential<'a>,
+        claims: &Map<String, Json>,
+    ) -> Vec<(String, String)> {
+        match self.session_cookie() {
+            Some(cookie) => cookie.issue(credential, claims),
+            None => Vec::new(),
+        }
+    }
 
     /// HTTP endpoints this plugin needs mounted on the proxy listener. Almost
     /// nothing wants this; `testing-plugin` does, because the claim sets it
@@ -97,6 +142,19 @@ pub struct Endpoint {
     pub plugin: String,
     pub path: String,
     pub configure: Arc<dyn Fn(&mut web::ServiceConfig) + Send + Sync>,
+}
+
+/// What a request offered a plugin, as the route's extraction found it.
+///
+/// Two fields rather than one because they answer different questions. The
+/// `token` is what this plugin must verify; the `session` is what the caller
+/// already carried, which a plugin may consult even when the token came from
+/// somewhere else -- that is how a `testing-plugin` takes a live session as
+/// the baseline its registered overrides are layered onto.
+#[derive(Clone, Copy)]
+pub struct Credential<'a> {
+    pub token: &'a str,
+    pub session: Option<&'a str>,
 }
 
 /// The future [`AuthPlugin::authenticate`] returns. Boxed because a trait with
@@ -173,10 +231,37 @@ pub fn number(params: &HashMap<String, Yaml>, key: &str, default: u64) -> Result
 }
 
 pub fn flag(params: &HashMap<String, Yaml>, key: &str) -> Result<bool, String> {
+    flag_or(params, key, false)
+}
+
+/// A flag whose absence does not mean "off". Cookie attributes are the reason:
+/// `secure` and `http-only` default to on, so forgetting them hardens the
+/// cookie rather than quietly exposing it.
+pub fn flag_or(params: &HashMap<String, Yaml>, key: &str, default: bool) -> Result<bool, String> {
     match params.get(key) {
         Some(Yaml::Bool(value)) => Ok(*value),
         Some(_) => Err(format!("'{key}' must be true or false")),
-        None => Ok(false),
+        None => Ok(default),
+    }
+}
+
+/// A nested block of `params`, such as `session-cookie:`. Handed back as a
+/// `HashMap` so every reader above applies to it unchanged.
+pub fn mapping(
+    params: &HashMap<String, Yaml>,
+    key: &str,
+) -> Result<Option<HashMap<String, Yaml>>, String> {
+    match params.get(key) {
+        Some(Yaml::Mapping(mapping)) => mapping
+            .iter()
+            .map(|(name, value)| match name.as_str() {
+                Some(name) => Ok((name.to_owned(), value.to_owned())),
+                None => Err(format!("'{key}' keys must be strings")),
+            })
+            .collect::<Result<HashMap<_, _>, String>>()
+            .map(Some),
+        Some(_) => Err(format!("'{key}' must be a mapping")),
+        None => Ok(None),
     }
 }
 

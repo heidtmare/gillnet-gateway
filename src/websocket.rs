@@ -1,6 +1,4 @@
-use std::collections::HashSet;
-
-use actix_web::http::header::HeaderMap;
+use actix_web::http::header::{HeaderMap, HeaderName, HeaderValue};
 use actix_web::{web, HttpRequest, HttpResponse};
 use actix_ws::{CloseReason, Message, MessageStream, ProtocolError, Session};
 use awc::ws::{self, Frame};
@@ -8,7 +6,8 @@ use awc::Client;
 use bytestring::ByteString;
 use futures_util::{SinkExt, Stream, StreamExt};
 
-use crate::proxy::{connection_tokens, forwarded_for, is_hop_by_hop};
+use crate::plugins::session;
+use crate::proxy::{connection_tokens, forwarded_for, is_hop_by_hop, Forwarding};
 use crate::registry::Resolved;
 
 pub fn is_upgrade(headers: &HeaderMap) -> bool {
@@ -30,8 +29,7 @@ pub async fn proxy(
     resolved: &Resolved,
     target: &str,
     max_frame_bytes: usize,
-    identity: &[(String, String)],
-    blocked: &HashSet<String>,
+    forwarding: &Forwarding,
 ) -> HttpResponse {
     let mut upstream_request = client
         .ws(websocket_url(target))
@@ -51,14 +49,29 @@ pub async fn proxy(
             || name == "content-length"
             || name.as_str().starts_with("sec-websocket-")
             || name.as_str().starts_with("x-forwarded-")
-            || blocked.contains(name.as_str())
+            || forwarding.blocked().contains(name.as_str())
         {
+            continue;
+        }
+        // The gateway's own cookies come out of the jar; the application's
+        // stay in, exactly as on the plain HTTP path.
+        if name == "cookie" && !forwarding.cookies().is_empty() {
+            match value
+                .to_str()
+                .ok()
+                .map(|jar| session::without(jar, forwarding.cookies()))
+            {
+                // Not UTF-8, so it cannot hold a cookie a guard read here.
+                None => upstream_request = upstream_request.header(name.clone(), value.clone()),
+                Some(Some(jar)) => upstream_request = upstream_request.set_header("cookie", jar),
+                Some(None) => {}
+            }
             continue;
         }
         upstream_request = upstream_request.header(name.clone(), value.clone());
     }
 
-    for (header, value) in identity {
+    for (header, value) in forwarding.identity() {
         upstream_request = upstream_request.set_header(header.as_str(), value.as_str());
     }
 
@@ -96,7 +109,15 @@ pub async fn proxy(
     let negotiated: Vec<&str> = negotiated.iter().map(String::as_str).collect();
 
     match actix_ws::handle_with_protocols(req, payload, &negotiated) {
-        Ok((response, session, stream)) => {
+        Ok((mut response, session, stream)) => {
+            // A handshake is the caller's first response as much as any other,
+            // so a session the guards minted has to reach the browser on it.
+            for (name, value) in forwarding.response() {
+                if let Ok((name, value)) = header(name, value) {
+                    response.headers_mut().append(name, value);
+                }
+            }
+
             actix_web::rt::spawn(relay(
                 session,
                 stream.max_frame_size(max_frame_bytes),
@@ -106,6 +127,13 @@ pub async fn proxy(
         }
         Err(error) => error.error_response(),
     }
+}
+
+fn header(name: &str, value: &str) -> Result<(HeaderName, HeaderValue), ()> {
+    let name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| ())?;
+    let value = HeaderValue::from_str(value).map_err(|_| ())?;
+
+    Ok((name, value))
 }
 
 /// Pumps frames in both directions until either peer closes, then closes the

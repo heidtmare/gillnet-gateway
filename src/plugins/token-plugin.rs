@@ -12,7 +12,7 @@ use serde_json::Map;
 
 use crate::auth::AuthOutcome;
 use crate::config::PluginConfig;
-use crate::plugins::{self, AuthPlugin, Authenticating};
+use crate::plugins::{self, AuthPlugin, Authenticating, Credential};
 
 pub const KIND: &str = "token-plugin";
 
@@ -57,11 +57,14 @@ impl AuthPlugin for TokenPlugin {
         None
     }
 
-    fn authenticate<'a>(&'a self, token: &'a str, _client: &'a Client) -> Authenticating<'a> {
-        let matched = self
-            .tokens
-            .iter()
-            .any(|candidate| constant_time_eq(candidate.as_bytes(), token.as_bytes()));
+    fn authenticate<'a>(
+        &'a self,
+        credential: Credential<'a>,
+        _client: &'a Client,
+    ) -> Authenticating<'a> {
+        let matched = self.tokens.iter().any(|candidate| {
+            constant_time_eq(candidate.as_bytes(), credential.token.as_bytes())
+        });
 
         Box::pin(async move {
             if matched {

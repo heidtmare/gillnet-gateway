@@ -15,7 +15,7 @@ use serde_json::{Map, Value as Json};
 use yaml_serde::Value as Yaml;
 
 use crate::config::PluginReference;
-use crate::plugins::{self, AuthPlugin};
+use crate::plugins::{self, session, AuthPlugin, Credential};
 
 /// One plugin as a single route uses it.
 #[derive(Clone)]
@@ -29,24 +29,40 @@ pub struct RouteGuard {
 /// only messages already meant for a caller, never a credential.
 #[derive(Debug)]
 pub enum AuthOutcome {
-    Allowed(Vec<(String, String)>),
+    Allowed(Allowed),
     Unauthorized(String),
     Forbidden(String),
     Unavailable(String),
 }
 
-/// Every guard on a route must pass; identity headers from all of them are merged.
+/// What passing the guards produced, in the two directions it travels.
+#[derive(Debug, Default)]
+pub struct Allowed {
+    /// Identity headers rendered from verified claims, sent to the upstream.
+    pub identity: Vec<(String, String)>,
+
+    /// Headers the gateway adds to the response on the way back -- the
+    /// `Set-Cookie` that starts a session. These come from the guard rather
+    /// than the upstream, so they survive whatever the upstream sends.
+    pub response: Vec<(String, String)>,
+}
+
+/// Every guard on a route must pass; what they produce in both directions is
+/// merged.
 pub async fn enforce(guards: &[RouteGuard], headers: &HeaderMap, client: &Client) -> AuthOutcome {
-    let mut identity = Vec::new();
+    let mut allowed = Allowed::default();
 
     for guard in guards {
         match guard.check(headers, client).await {
-            Ok(mut injected) => identity.append(&mut injected),
+            Ok(mut passed) => {
+                allowed.identity.append(&mut passed.identity);
+                allowed.response.append(&mut passed.response);
+            }
             Err(outcome) => return outcome,
         }
     }
 
-    AuthOutcome::Allowed(identity)
+    AuthOutcome::Allowed(allowed)
 }
 
 /// Header names the gateway itself sets from verified claims. Client-supplied
@@ -77,6 +93,33 @@ pub fn credential_header_names(guards: &[RouteGuard]) -> HashSet<String> {
                 .flat_map(|guard| guard.plugin.header_keys())
                 .map(|key| key.to_ascii_lowercase()),
         )
+        .collect()
+}
+
+/// Cookies the gateway owns on this route: the ones a guard reads a credential
+/// from, and the one it mints. Taken out of the forwarded `Cookie` header on
+/// the same terms as [`credential_header_names`] -- but one cookie at a time,
+/// because the rest of the jar belongs to the application and dropping it
+/// would sign the user out of everything else the page is doing.
+///
+/// Cookie names are case-sensitive, so unlike header names these are compared
+/// as written.
+pub fn credential_cookie_names(guards: &[RouteGuard]) -> HashSet<String> {
+    guards
+        .iter()
+        .flat_map(|guard| {
+            guard
+                .plugin
+                .cookie_keys()
+                .iter()
+                .map(String::to_owned)
+                .chain(
+                    guard
+                        .plugin
+                        .session_cookie()
+                        .map(|cookie| cookie.name().to_owned()),
+                )
+        })
         .collect()
 }
 
@@ -153,25 +196,55 @@ impl RouteGuard {
         &self.insert_headers
     }
 
+    /// The session cookie this route's plugin mints, if it mints one. Reported
+    /// by `describe` because a route that hands out a credential is worth
+    /// seeing without reading the config for it.
+    pub fn session_cookie(&self) -> Option<&str> {
+        self.plugin.session_cookie().map(|cookie| cookie.name())
+    }
+
+    /// Cookies it reads a credential from.
+    pub fn cookie_keys(&self) -> &[String] {
+        self.plugin.cookie_keys()
+    }
+
     /// Extract, verify, authorize, render -- the same four steps whatever the
     /// plugin type, because everything type-specific happens inside
     /// `authenticate`.
-    async fn check(
-        &self,
-        headers: &HeaderMap,
-        client: &Client,
-    ) -> Result<Vec<(String, String)>, AuthOutcome> {
-        let Some(token) = extract_token(headers, self.plugin.header_keys()) else {
+    async fn check(&self, headers: &HeaderMap, client: &Client) -> Result<Allowed, AuthOutcome> {
+        let jar = headers
+            .get("cookie")
+            .and_then(|value| value.to_str().ok());
+
+        // The session a caller already holds, whether or not it is also the
+        // credential being verified: a plugin may want it as context even when
+        // the token came from a header.
+        let session = self
+            .plugin
+            .session_cookie()
+            .and_then(|cookie| session::from_jar(jar, cookie.name()));
+
+        let Some(token) = extract_token(headers, self.plugin.header_keys())
+            .or_else(|| cookie_credential(jar, self.plugin.cookie_keys()))
+        else {
             return Err(AuthOutcome::Unauthorized(format!(
                 "missing credentials for '{}'",
                 self.name()
             )));
         };
 
-        let claims = self.plugin.authenticate(&token, client).await?;
+        let credential = Credential {
+            token: &token,
+            session,
+        };
+        let claims = self.plugin.authenticate(credential, client).await?;
 
         self.authorize(&claims)?;
-        self.render_identity(&claims)
+
+        Ok(Allowed {
+            identity: self.render_identity(&claims)?,
+            response: self.plugin.issue(credential, &claims),
+        })
     }
 
     fn authorize(&self, claims: &Map<String, Json>) -> Result<(), AuthOutcome> {
@@ -245,6 +318,16 @@ fn extract_token(headers: &HeaderMap, header_keys: &[String]) -> Option<String> 
     })
 }
 
+/// A credential out of the cookie jar, tried only once every header has come
+/// up empty: an explicit `Authorization` is a deliberate act and a cookie is
+/// one the browser made on the caller's behalf, so the explicit one wins.
+fn cookie_credential(jar: Option<&str>, cookie_keys: &[String]) -> Option<String> {
+    cookie_keys
+        .iter()
+        .find_map(|name| session::from_jar(jar, name))
+        .map(str::to_owned)
+}
+
 fn roles(claims: &Map<String, Json>, roles_claim: &str) -> Vec<String> {
     match claims.get(roles_claim) {
         Some(Json::Array(values)) => values
@@ -287,7 +370,7 @@ fn claim_to_string(value: &Json) -> Option<String> {
 mod tests {
     use super::*;
     use crate::config::PluginConfig;
-    use crate::plugins::{jwt, token};
+    use crate::plugins::{jwt, testing, token};
     use actix_web::http::header::{HeaderName, HeaderValue};
     use serde_json::json;
 
@@ -312,6 +395,25 @@ mod tests {
 
     fn claims(value: Json) -> Map<String, Json> {
         value.as_object().unwrap().to_owned()
+    }
+
+    /// A token the `secret: shh` test plugins verify, as an `oauth2-plugin`
+    /// would have minted it into a session cookie.
+    fn jwt_token() -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            &json!({"sub": "u1", "roles": ["user"], "exp": far_future()}),
+            &jsonwebtoken::EncodingKey::from_secret(b"shh"),
+        )
+        .expect("could not sign the test token")
+    }
+
+    fn far_future() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64
+            + 3600
     }
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
@@ -478,6 +580,103 @@ mod tests {
 
         // An unguarded route consumed nothing, so it withholds nothing.
         assert!(credential_header_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_header_credential_wins_over_a_cookie() {
+        let guard = guard(jwt::KIND, "{secret: shh, cookie: sid}", "{}").unwrap();
+        let keys = guard.plugin.header_keys();
+        let jar = Some("theme=dark; sid=from-cookie");
+
+        // An `Authorization` is something the caller chose to send; a cookie is
+        // what the browser attached on their behalf, so the explicit one wins.
+        assert_eq!(
+            extract_token(&headers(&[("authorization", "Bearer from-header")]), keys),
+            Some("from-header".to_owned())
+        );
+        assert_eq!(
+            cookie_credential(jar, guard.plugin.cookie_keys()),
+            Some("from-cookie".to_owned())
+        );
+        // A cookie the plugin was not pointed at is not a credential.
+        assert_eq!(cookie_credential(Some("other=x"), guard.plugin.cookie_keys()), None);
+        assert_eq!(cookie_credential(None, guard.plugin.cookie_keys()), None);
+    }
+
+    #[test]
+    fn a_guarded_route_withholds_the_cookies_it_owns_and_no_others() {
+        let reads = guard(jwt::KIND, "{secret: shh, cookie: sid}", "{}").unwrap();
+        let names = credential_cookie_names(std::slice::from_ref(&reads));
+
+        assert!(names.contains("sid"));
+        assert_eq!(names.len(), 1, "the application's cookies are not ours");
+
+        // A plugin that only *mints* a cookie still owns it: sending the
+        // upstream a session the gateway just issued serves nobody.
+        let mints = guard(
+            testing::KIND,
+            "session-cookie: {secret: shh, name: minted}",
+            "{}",
+        )
+        .unwrap();
+        assert!(credential_cookie_names(std::slice::from_ref(&mints)).contains("minted"));
+
+        // A plugin with no cookie of its own leaves the jar alone entirely.
+        let neither = guard(jwt::KIND, "secret: shh", "{}").unwrap();
+        assert!(credential_cookie_names(std::slice::from_ref(&neither)).is_empty());
+        assert!(credential_cookie_names(&[]).is_empty());
+    }
+
+    #[actix_web::test]
+    async fn a_session_cookie_carries_a_caller_through_the_whole_guard() {
+        let guard = guard(
+            jwt::KIND,
+            "{secret: shh, cookie: sid}",
+            "insert-headers: {'x-user': '{sub}'}",
+        )
+        .unwrap();
+
+        // No `Authorization` anywhere: the browser is carrying a session the
+        // way it would on any page behind a login.
+        let token = jwt_token();
+        let AuthOutcome::Allowed(allowed) = enforce(
+            std::slice::from_ref(&guard),
+            &headers(&[("cookie", &format!("theme=dark; sid={token}"))]),
+            &Client::default(),
+        )
+        .await
+        else {
+            panic!("a signed session cookie must authenticate");
+        };
+
+        assert_eq!(allowed.identity, [("x-user".to_owned(), "u1".to_owned())]);
+        // The jwt-plugin mints nothing, so there is no cookie to send back.
+        assert!(allowed.response.is_empty());
+    }
+
+    #[actix_web::test]
+    async fn a_cookie_that_does_not_verify_is_refused_like_any_other_token() {
+        let guard = guard(jwt::KIND, "{secret: shh, cookie: sid}", "{}").unwrap();
+
+        let outcome = enforce(
+            std::slice::from_ref(&guard),
+            &headers(&[("cookie", "sid=forged")]),
+            &Client::default(),
+        )
+        .await;
+        assert!(matches!(outcome, AuthOutcome::Unauthorized(_)));
+
+        // A jar with no session in it is no credential at all.
+        let outcome = enforce(
+            std::slice::from_ref(&guard),
+            &headers(&[("cookie", "theme=dark")]),
+            &Client::default(),
+        )
+        .await;
+        let AuthOutcome::Unauthorized(message) = outcome else {
+            panic!("a missing session is missing credentials");
+        };
+        assert!(message.contains("missing credentials"), "unexpected: {message}");
     }
 
     #[test]
