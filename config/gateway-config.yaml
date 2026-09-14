@@ -17,6 +17,28 @@ proxy:
   # Larger frames close the connection with 1009. Applies to both directions.
   websocket-max-frame-bytes: 65536
 
+# Test scaffolding. MUST stay false in production.
+#
+# When enabled, /testing/userinfo is mounted on the PUBLIC proxy port and a
+# claim set posted there stands in for the whole oauth2-plugin check for that
+# token -- no introspection, no UserInfo call, so routes can be exercised with
+# no identity provider reachable. That also means anyone who can reach the
+# endpoint can mint any identity, including any role. This flag is the only
+# thing stopping them; /registry/describe reports its value under summary.
+#
+#   POST   /testing/userinfo        {"token": "...", "claims": {...}}  replace
+#   PATCH  /testing/userinfo        {"token": "...", "claims": {...}}  merge
+#                                   (a null claim value removes the claim)
+#   GET    /testing/userinfo        list overrides (ids, never the tokens)
+#   GET    /testing/userinfo/{id}   one override
+#   DELETE /testing/userinfo/{id}   drop one
+#   DELETE /testing/userinfo        drop all
+#
+# `id` is the token's SHA-256, so it can be pasted around safely. An `exp`
+# claim in the past is still honoured, which is how expiry gets tested.
+testing:
+  userinfo-overrides: false
+
 # Statically declared backends. These cannot self-register, and they win over
 # any dynamic registration that claims the same name.
 # services:

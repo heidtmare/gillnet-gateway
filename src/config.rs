@@ -15,6 +15,9 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub proxy: ProxyConfig,
 
+    #[serde(default)]
+    pub testing: TestingConfig,
+
     pub plugins: Option<Vec<PluginConfig>>,
     pub services: Option<Vec<ServiceConfig>>,
 
@@ -99,6 +102,19 @@ impl Default for ProxyConfig {
             websocket_max_frame_bytes: default_websocket_max_frame_bytes(),
         }
     }
+}
+
+/// Off unless a config file says otherwise, because the only thing standing
+/// between these endpoints and the public proxy listener is this flag.
+#[derive(Clone, Copy, Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TestingConfig {
+    /// Mounts /testing/userinfo on the proxy port and lets the claim sets
+    /// posted there stand in for the authorization provider. Test only.
+    #[serde(alias = "userinfo-overrides")]
+    #[serde(alias = "userinfoOverrides")]
+    #[serde(default)]
+    pub userinfo_overrides: bool,
 }
 
 fn default_websocket_max_frame_bytes() -> usize {

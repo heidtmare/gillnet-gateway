@@ -15,6 +15,7 @@ pub struct Registry {
     policies: HashMap<String, Arc<AuthPolicy>>,
     services: HashMap<String, RegisteredService>,
     ttl: Duration,
+    userinfo_overrides: bool,
 }
 
 #[derive(Default)]
@@ -173,6 +174,11 @@ pub struct DescribeView {
 #[serde(rename_all = "camelCase")]
 pub struct SummaryView {
     pub heartbeat_ttl_seconds: u64,
+
+    /// Surfaced so an operator can confirm at a glance that a production
+    /// gateway is not accepting test claim overrides.
+    pub testing_userinfo_overrides: bool,
+
     pub services: usize,
     pub instances: usize,
     pub routes: usize,
@@ -286,6 +292,7 @@ impl Registry {
             policies,
             services: HashMap::new(),
             ttl: Duration::from_secs(config.registration.heartbeat_ttl_seconds),
+            userinfo_overrides: config.testing.userinfo_overrides,
         }
     }
 
@@ -486,6 +493,7 @@ impl Registry {
         DescribeView {
             summary: SummaryView {
                 heartbeat_ttl_seconds: self.ttl.as_secs(),
+                testing_userinfo_overrides: self.userinfo_overrides,
                 services: services.len(),
                 instances: services.iter().map(|s| s.instances.len()).sum(),
                 routes: routes.len(),

@@ -12,6 +12,7 @@ use sha2::{Digest, Sha256};
 use yaml_serde::Value as Yaml;
 
 use crate::config::{PluginConfig, PluginReference};
+use crate::testing::ClaimOverrides;
 
 pub enum AuthPolicy {
     StaticToken {
@@ -71,11 +72,12 @@ pub async fn enforce(
     guards: &[RouteGuard],
     headers: &HeaderMap,
     client: &Client,
+    overrides: &ClaimOverrides,
 ) -> AuthOutcome {
     let mut identity = Vec::new();
 
     for guard in guards {
-        match guard.check(headers, client).await {
+        match guard.check(headers, client, overrides).await {
             Ok(mut injected) => identity.append(&mut injected),
             Err(outcome) => return outcome,
         }
@@ -206,7 +208,21 @@ impl OAuth2Policy {
         &self,
         token: &str,
         client: &Client,
+        overrides: &ClaimOverrides,
     ) -> Result<Arc<Map<String, Json>>, AuthOutcome> {
+        // A test override replaces the provider outright rather than being
+        // merged with it, so routes can be exercised with no IdP reachable.
+        // Overrides are never cached -- they are already in memory, and a
+        // cached copy would outlive a PATCH that changed them.
+        if let Some(claims) = overrides.get(token) {
+            if expired(&claims) {
+                return Err(AuthOutcome::Unauthorized(
+                    "token rejected by the authorization provider".to_owned(),
+                ));
+            }
+            return Ok(claims);
+        }
+
         let key = Sha256::digest(token.as_bytes()).into();
 
         if let Some(cached) = self.cached(&key) {
@@ -224,12 +240,7 @@ impl OAuth2Policy {
             .get("active")
             .and_then(Json::as_bool)
             .unwrap_or(false);
-        let expired = introspection
-            .get("exp")
-            .and_then(Json::as_i64)
-            .is_some_and(|exp| exp <= unix_now());
-
-        if !active || expired {
+        if !active || expired(&introspection) {
             self.store(key, CachedOutcome::Inactive, self.cache_negative);
             return Err(AuthOutcome::Unauthorized(
                 "token rejected by the authorization provider".to_owned(),
@@ -353,6 +364,15 @@ impl OAuth2Policy {
     }
 }
 
+/// An `exp` in the past, whether it came from the provider or from a test
+/// override, means the token is no longer good.
+fn expired(claims: &Map<String, Json>) -> bool {
+    claims
+        .get("exp")
+        .and_then(Json::as_i64)
+        .is_some_and(|exp| exp <= unix_now())
+}
+
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -430,6 +450,7 @@ impl RouteGuard {
         &self,
         headers: &HeaderMap,
         client: &Client,
+        overrides: &ClaimOverrides,
     ) -> Result<Vec<(String, String)>, AuthOutcome> {
         let Some(token) = extract_token(headers, self.policy.header_keys()) else {
             return Err(AuthOutcome::Unauthorized(format!(
@@ -473,7 +494,7 @@ impl RouteGuard {
                 self.render_identity(&claims)
             }
             AuthPolicy::OAuth2(policy) => {
-                let claims = policy.claims(&token, client).await?;
+                let claims = policy.claims(&token, client, overrides).await?;
 
                 self.authorize(&claims, &policy.roles_claim)?;
                 self.render_identity(&claims)
