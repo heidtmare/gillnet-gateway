@@ -1,11 +1,7 @@
 mod components;
 mod config;
 
-use actix_web::{
-    web::{self, resource},
-    App, HttpRequest, HttpServer,
-};
-use actix_web_lab::web::{redirect, Redirect};
+use actix_web::{web::resource, App, HttpRequest, HttpServer};
 use components::{Plugin, Route, Service};
 use config::{GatewayConfig, PluginConfig, RouteConfig, ServiceConfig, MatchType};
 use std::{collections::HashMap, env, fs};
