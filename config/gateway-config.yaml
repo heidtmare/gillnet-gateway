@@ -9,6 +9,11 @@ registration:
   heartbeat-ttl-seconds: 30
   reap-interval-seconds: 10
 
+proxy:
+  # Upstream response timeout -> 504. Connect failures -> 502.
+  timeout-seconds: 30
+  connect-timeout-seconds: 5
+
 # Statically declared backends. These cannot self-register, and they win over
 # any dynamic registration that claims the same name.
 # services:

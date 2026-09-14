@@ -12,6 +12,9 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub registration: RegistrationConfig,
 
+    #[serde(default)]
+    pub proxy: ProxyConfig,
+
     pub plugins: Option<Vec<PluginConfig>>,
     pub services: Option<Vec<ServiceConfig>>,
 
@@ -67,6 +70,37 @@ impl Default for RegistrationConfig {
             reap_interval_seconds: default_reap_interval_seconds(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyConfig {
+    #[serde(alias = "timeout-seconds")]
+    #[serde(alias = "timeoutSeconds")]
+    #[serde(default = "default_proxy_timeout_seconds")]
+    pub timeout_seconds: u64,
+
+    #[serde(alias = "connect-timeout-seconds")]
+    #[serde(alias = "connectTimeoutSeconds")]
+    #[serde(default = "default_connect_timeout_seconds")]
+    pub connect_timeout_seconds: u64,
+}
+
+impl Default for ProxyConfig {
+    fn default() -> Self {
+        Self {
+            timeout_seconds: default_proxy_timeout_seconds(),
+            connect_timeout_seconds: default_connect_timeout_seconds(),
+        }
+    }
+}
+
+fn default_proxy_timeout_seconds() -> u64 {
+    30
+}
+
+fn default_connect_timeout_seconds() -> u64 {
+    5
 }
 
 fn default_host() -> String {

@@ -1,15 +1,17 @@
 mod api;
 mod config;
+mod proxy;
 mod registry;
 
 use std::sync::RwLock;
 use std::time::Duration;
 use std::{env, fs};
 
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+use actix_web::{web, App, HttpServer};
+use awc::{Client, Connector};
 
 use config::GatewayConfig;
-use registry::{Registry, Resolution};
+use registry::Registry;
 
 #[actix_web::main]
 async fn main() -> Result<(), std::io::Error> {
@@ -21,6 +23,8 @@ async fn main() -> Result<(), std::io::Error> {
     let proxy_port = config.listen.proxy_port;
     let registration_port = config.listen.registration_port;
     let reap_interval = Duration::from_secs(config.registration.reap_interval_seconds);
+    let proxy_timeout = Duration::from_secs(config.proxy.timeout_seconds);
+    let connect_timeout = Duration::from_secs(config.proxy.connect_timeout_seconds);
 
     let registry = web::Data::new(RwLock::new(Registry::from_config(&config)));
 
@@ -41,9 +45,17 @@ async fn main() -> Result<(), std::io::Error> {
     let proxy = HttpServer::new({
         let registry = registry.clone();
         move || {
+            // One pooled client per worker thread; awc clients are not Send.
+            let client = Client::builder()
+                .timeout(proxy_timeout)
+                .connector(Connector::new().timeout(connect_timeout))
+                .disable_redirects()
+                .finish();
+
             App::new()
                 .app_data(registry.clone())
-                .default_service(web::to(proxy_handler))
+                .app_data(web::Data::new(client))
+                .default_service(web::to(proxy::handler))
         }
     })
     .bind((host.as_str(), proxy_port))?
@@ -65,25 +77,4 @@ async fn main() -> Result<(), std::io::Error> {
 
     futures_util::try_join!(proxy, registration)?;
     Ok(())
-}
-
-async fn proxy_handler(req: HttpRequest, registry: web::Data<RwLock<Registry>>) -> HttpResponse {
-    let resolution = { registry.read().unwrap().resolve(req.path()) };
-
-    match resolution {
-        Resolution::Resolved(resolved) => HttpResponse::Ok().body(format!(
-            "RESOLVED route={} source={} service={} instance={} target={}\n",
-            resolved.route,
-            resolved.source,
-            resolved.service.as_deref().unwrap_or("-"),
-            resolved.instance.as_deref().unwrap_or("-"),
-            resolved.target_url,
-        )),
-        Resolution::NoInstances { route, service } => HttpResponse::ServiceUnavailable().body(
-            format!("no registered instances for service '{service}' (route '{route}')\n"),
-        ),
-        Resolution::NotFound => {
-            HttpResponse::NotFound().body(format!("no route matches '{}'\n", req.path()))
-        }
-    }
 }
