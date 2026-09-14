@@ -96,6 +96,27 @@ pub fn injected_header_names(guards: &[RouteGuard]) -> HashSet<String> {
         .collect()
 }
 
+/// Headers a guard on this route would read a credential out of: the standard
+/// `Authorization`, plus whatever `keys:` each policy was configured with.
+/// Stripped before forwarding unless the route opts into `forward-token`.
+///
+/// An unguarded route yields nothing -- the gateway never looked at a
+/// credential there, so it has none to withhold and stays a plain pass-through.
+pub fn credential_header_names(guards: &[RouteGuard]) -> HashSet<String> {
+    if guards.is_empty() {
+        return HashSet::new();
+    }
+
+    std::iter::once("authorization".to_owned())
+        .chain(
+            guards
+                .iter()
+                .flat_map(|guard| guard.policy.header_keys())
+                .map(|key| key.to_ascii_lowercase()),
+        )
+        .collect()
+}
+
 impl AuthPolicy {
     /// The plugin `type:` this policy was built from, so /registry/describe can
     /// report what a route is guarded by without exposing the credentials.

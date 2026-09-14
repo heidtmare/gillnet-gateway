@@ -82,7 +82,17 @@ plugins:
       cache-negative-seconds: 5
       cache-max-entries: 10000
 
-# Static routes. A route whose `url` is not http(s):// is a service reference,
+# Static routes.
+#
+# A guarded route strips the credential it authenticated with -- Authorization
+# and any header named in the plugin's `keys:` -- before forwarding, so a
+# backend is never handed a token it could replay elsewhere. Set
+# `forward-token: true` on routes whose backend genuinely needs it (it wants to
+# read claims itself, or it calls another API on the user's behalf).
+# Unguarded routes are untouched pass-throughs; there is no credential the
+# gateway consumed, so there is none to withhold.
+#
+# A route whose `url` is not http(s):// is a service reference,
 # resolved against static `services:` first, then the self-registration registry —
 # so a static route can point at a name that pods fill in at runtime.
 routes:
@@ -101,6 +111,8 @@ routes:
   - name: my-application-svc-user-route
     url: my-application-svc
     paths: [/svc/user]
+    # This backend reads the JWT itself, so it needs the original header.
+    forward-token: true
     plugins:
       - name: my-jwt-plugin
         params:

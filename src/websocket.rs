@@ -31,7 +31,7 @@ pub async fn proxy(
     target: &str,
     max_frame_bytes: usize,
     identity: &[(String, String)],
-    reserved: &HashSet<String>,
+    blocked: &HashSet<String>,
 ) -> HttpResponse {
     let mut upstream_request = client
         .ws(websocket_url(target))
@@ -51,7 +51,7 @@ pub async fn proxy(
             || name == "content-length"
             || name.as_str().starts_with("sec-websocket-")
             || name.as_str().starts_with("x-forwarded-")
-            || reserved.contains(name.as_str())
+            || blocked.contains(name.as_str())
         {
             continue;
         }

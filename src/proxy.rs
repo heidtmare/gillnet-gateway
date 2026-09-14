@@ -69,9 +69,15 @@ pub async fn handler(
             return HttpResponse::ServiceUnavailable().body(format!("{message}\n"))
         }
     };
-    // A client could otherwise send these itself and impersonate a user to a
-    // backend that trusts them.
-    let reserved = auth::injected_header_names(&resolved.guards);
+    // Headers the client's own copy of must not reach the upstream: the
+    // identity headers we derive from verified claims, which a client could
+    // otherwise send itself to impersonate a user to a backend that trusts
+    // them; and, unless the route opted into forward-token, the credential the
+    // guards just consumed, which the backend has no need to hold.
+    let mut blocked = auth::injected_header_names(&resolved.guards);
+    if !resolved.forward_token {
+        blocked.extend(auth::credential_header_names(&resolved.guards));
+    }
 
     if websocket::is_upgrade(req.headers()) {
         return websocket::proxy(
@@ -82,7 +88,7 @@ pub async fn handler(
             &target,
             settings.websocket_max_frame_bytes,
             &identity,
-            &reserved,
+            &blocked,
         )
         .await;
     }
@@ -102,7 +108,7 @@ pub async fn handler(
             || name == "host"
             || name == "content-length"
             || name.as_str().starts_with("x-forwarded-")
-            || reserved.contains(name.as_str())
+            || blocked.contains(name.as_str())
         {
             continue;
         }

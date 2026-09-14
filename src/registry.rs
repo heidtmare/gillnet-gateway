@@ -34,6 +34,7 @@ struct CompiledRoute {
     name: String,
     target: Target,
     strip_path: bool,
+    forward_token: bool,
     match_type: MatchType,
     paths: Vec<String>,
     patterns: Vec<Pattern>,
@@ -78,6 +79,10 @@ pub struct RouteSpec {
     #[serde(default)]
     pub strip_path: bool,
 
+    /// Opt in to having the caller's credential relayed to this instance.
+    #[serde(default)]
+    pub forward_token: bool,
+
     #[serde(default)]
     pub plugins: Vec<PluginRequirement>,
 }
@@ -114,6 +119,7 @@ pub struct Resolved {
     pub instance: Option<String>,
     pub target_url: String,
     pub guards: Vec<RouteGuard>,
+    pub forward_token: bool,
 }
 
 #[derive(Serialize)]
@@ -138,6 +144,7 @@ pub struct RouteView {
     pub paths: Vec<String>,
     pub match_type: MatchType,
     pub strip_path: bool,
+    pub forward_token: bool,
     pub plugins: Vec<String>,
 }
 
@@ -213,6 +220,7 @@ pub struct DescribedRoute {
     pub paths: Vec<String>,
     pub match_type: MatchType,
     pub strip_path: bool,
+    pub forward_token: bool,
     pub plugins: Vec<GuardView>,
 }
 
@@ -404,6 +412,7 @@ impl Registry {
                         paths: route.paths.to_owned(),
                         match_type: route.match_type,
                         strip_path: route.strip_path,
+                        forward_token: route.forward_token,
                         plugins: route.guards.iter().map(|g| g.name().to_owned()).collect(),
                     })
                     .collect(),
@@ -588,6 +597,7 @@ impl Registry {
             paths: route.paths.to_owned(),
             match_type: route.match_type,
             strip_path: route.strip_path,
+            forward_token: route.forward_token,
             plugins: route
                 .guards
                 .iter()
@@ -653,6 +663,7 @@ impl Registry {
             instance,
             target_url: format!("{}{}", base_url.trim_end_matches('/'), upstream_path),
             guards: route.guards.to_owned(),
+            forward_token: route.forward_token,
         })
     }
 
@@ -708,6 +719,7 @@ impl CompiledRoute {
             name: config.name.to_owned(),
             target: Target::parse(&config.url),
             strip_path: config.strip_path,
+            forward_token: config.forward_token,
             match_type: config.match_type,
             paths: config.paths.to_owned(),
             patterns: compile_patterns(&config.paths, config.match_type)?,
@@ -743,6 +755,7 @@ impl CompiledRoute {
             name: format!("{service}#{index}"),
             target: Target::Service(service.to_owned()),
             strip_path: spec.strip_path,
+            forward_token: spec.forward_token,
             match_type: spec.match_type,
             paths: spec.paths.to_owned(),
             patterns: compile_patterns(&spec.paths, spec.match_type)?,

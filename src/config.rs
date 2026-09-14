@@ -185,6 +185,15 @@ pub struct RouteConfig {
     #[serde(default)]
     pub strip_path: bool,
 
+    /// Whether the credential the guards authenticated with is relayed to the
+    /// upstream. Off by default: a backend behind the gateway has no need for
+    /// the caller's token, and forwarding one hands it a credential it can
+    /// replay elsewhere.
+    #[serde(alias = "forward-token")]
+    #[serde(alias = "forwardToken")]
+    #[serde(default)]
+    pub forward_token: bool,
+
     pub plugins: Option<Vec<PluginReference>>,
 }
 
